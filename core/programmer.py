@@ -167,8 +167,14 @@ class ByteProgrammer:
         pr_url = pr.get("links", {}).get("html", {}).get("href", "")
         pr_id = pr.get("id")
 
-        # 9. Přepni Jira ticket na Ready to test
+        # 9. Přepni Jira ticket na Ready to test + přiřaď zpět na předchozího assignee
         await self._jira.transition(issue_key, "Ready to test")
+        previous_account_id = (ticket_ctx.get("previous_assignee") or {}).get("account_id")
+        if previous_account_id:
+            await self._jira.assign(issue_key, previous_account_id)
+            logger.info(f"[Programmer] {issue_key} přiřazen zpět na {reviewer_name}")
+        else:
+            logger.warning(f"[Programmer] {issue_key} — předchozí assignee nenalezen, ticket zůstává na Byte")
 
         # 10. Závěrečný komentář do Jiry — s formátováním
         reviewer_name = (ticket_ctx.get("previous_assignee") or {}).get("display_name", "reviewer")
