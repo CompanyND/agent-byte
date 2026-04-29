@@ -35,11 +35,11 @@ agents:
     enabled: true
     model: *default_model
     jira:
-      email: "agent+byte@netdirect.cz"
+      email: "ai-agent-developers+byte@netdirect.cz"
       token_expires: ""
       allowed_projects: []
     bitbucket:
-      email: "agent+byte@netdirect.cz"
+      email: "ai-agent-developers+byte@netdirect.cz"
       auth_method: "oauth2"
     teams: ~
 
@@ -47,7 +47,7 @@ agents:
     enabled: false
     model: *precise_model
     jira:
-      email: "agent+atlas@netdirect.cz"
+      email: "ai-agent-developers+atlas@netdirect.cz"
       token_expires: ""
       allowed_projects: []
     bitbucket: ~
@@ -57,7 +57,7 @@ agents:
     enabled: false
     model: *fast_model
     jira:
-      email: "agent+lucy@netdirect.cz"
+      email: "ai-agent-developers+lucy@netdirect.cz"
       token_expires: ""
       allowed_projects: []
     bitbucket: ~
