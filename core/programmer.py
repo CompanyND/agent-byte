@@ -170,9 +170,10 @@ class ByteProgrammer:
         # 9. Přepni Jira ticket na Ready to test + přiřaď zpět na předchozího assignee
         await self._jira.transition(issue_key, "Ready to test")
         previous_account_id = (ticket_ctx.get("previous_assignee") or {}).get("account_id")
+        previous_name = (ticket_ctx.get("previous_assignee") or {}).get("display_name", "předchozí assignee")
         if previous_account_id:
             await self._jira.assign(issue_key, previous_account_id)
-            logger.info(f"[Programmer] {issue_key} přiřazen zpět na {reviewer_name}")
+            logger.info(f"[Programmer] {issue_key} přiřazen zpět na {previous_name}")
         else:
             logger.warning(f"[Programmer] {issue_key} — předchozí assignee nenalezen, ticket zůstává na Byte")
 
