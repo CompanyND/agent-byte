@@ -5,6 +5,7 @@ Byte vystupuje vždy pod vlastním účtem (BYTE_JIRA_API_TOKEN).
 
 from __future__ import annotations
 
+import re
 import httpx
 import logging
 from typing import Optional
@@ -30,35 +31,119 @@ class JiraClient:
 
     def _text_to_adf(self, text: str) -> dict:
         """
-        Převede plain text na Atlassian Document Format (ADF).
-        Jira API v3 vyžaduje ADF pro body komentářů.
-        Zachová základní markdown (code bloky).
+        Převede Markdown text na Atlassian Document Format (ADF).
+        Podporuje: **bold**, `code`, [link](url), nadpisy ##/###, code bloky ```.
         """
-        # Rozdělíme text na odstavce
-        paragraphs = text.strip().split("\n\n")
         content = []
-        for para in paragraphs:
-            para = para.strip()
-            if not para:
-                continue
-            # Code block detekce
-            if para.startswith("```") and para.endswith("```"):
-                code = para.strip("`").strip()
+        lines = text.strip().split("\n")
+        i = 0
+
+        while i < len(lines):
+            line = lines[i]
+
+            # Code blok (```)
+            if line.strip().startswith("```"):
+                code_lines = []
+                i += 1
+                while i < len(lines) and not lines[i].strip().startswith("```"):
+                    code_lines.append(lines[i])
+                    i += 1
                 content.append({
                     "type": "codeBlock",
-                    "content": [{"type": "text", "text": code}]
+                    "attrs": {},
+                    "content": [{"type": "text", "text": "\n".join(code_lines)}]
                 })
-            else:
-                # Normální odstavec — zachováme newlines jako hard breaks
-                lines = para.split("\n")
-                inline = []
-                for i, line in enumerate(lines):
-                    inline.append({"type": "text", "text": line})
-                    if i < len(lines) - 1:
-                        inline.append({"type": "hardBreak"})
+                i += 1
+                continue
+
+            # Nadpis ###
+            if line.startswith("### "):
+                content.append({
+                    "type": "heading",
+                    "attrs": {"level": 3},
+                    "content": [{"type": "text", "text": line[4:].strip()}]
+                })
+                i += 1
+                continue
+
+            # Nadpis ##
+            if line.startswith("## "):
+                content.append({
+                    "type": "heading",
+                    "attrs": {"level": 2},
+                    "content": [{"type": "text", "text": line[3:].strip()}]
+                })
+                i += 1
+                continue
+
+            # Nadpis #
+            if line.startswith("# "):
+                content.append({
+                    "type": "heading",
+                    "attrs": {"level": 1},
+                    "content": [{"type": "text", "text": line[2:].strip()}]
+                })
+                i += 1
+                continue
+
+            # Prázdný řádek — přeskočit
+            if not line.strip():
+                i += 1
+                continue
+
+            # Normální odstavec s inline formátováním
+            inline = self._parse_inline(line)
+            if inline:
                 content.append({"type": "paragraph", "content": inline})
+            i += 1
+
+        if not content:
+            content.append({
+                "type": "paragraph",
+                "content": [{"type": "text", "text": text}]
+            })
 
         return {"type": "doc", "version": 1, "content": content}
+
+    def _parse_inline(self, text: str) -> list:
+        """Parsuje inline Markdown: **bold**, `code`, [text](url), plain text."""
+        nodes = []
+        pattern = re.compile(
+            r'(\*\*(.+?)\*\*)'         # **bold**
+            r'|(`(.+?)`)'               # `code`
+            r'|(\[(.+?)\]\((.+?)\))'   # [text](url)
+        )
+        last = 0
+        for m in pattern.finditer(text):
+            # Text před matchem
+            if m.start() > last:
+                nodes.append({"type": "text", "text": text[last:m.start()]})
+
+            if m.group(1):  # **bold**
+                nodes.append({
+                    "type": "text",
+                    "text": m.group(2),
+                    "marks": [{"type": "strong"}]
+                })
+            elif m.group(3):  # `code`
+                nodes.append({
+                    "type": "text",
+                    "text": m.group(4),
+                    "marks": [{"type": "code"}]
+                })
+            elif m.group(5):  # [text](url)
+                nodes.append({
+                    "type": "text",
+                    "text": m.group(6),
+                    "marks": [{"type": "link", "attrs": {"href": m.group(7)}}]
+                })
+            last = m.end()
+
+        # Zbytek textu
+        if last < len(text):
+            nodes.append({"type": "text", "text": text[last:]})
+
+        return nodes if nodes else [{"type": "text", "text": text}]
 
     # -------------------------------------------------------------------------
     # Čtení ticketů
@@ -72,7 +157,6 @@ class JiraClient:
             "fields": "summary,description,status,assignee,reporter,comment,"
                      "customfield_10014,priority,labels,components,attachment,"
                      "customfield_10016,customfield_10000"
-                     # 10014 = Epic Link, 10016 = Story Points, 10000 = AK (typicky)
         }
         async with httpx.AsyncClient() as client:
             resp = await client.get(url, params=params, auth=self._auth, timeout=15)
@@ -93,10 +177,8 @@ class JiraClient:
         fields = ticket.get("fields", {})
         changelog = ticket.get("changelog", {}).get("histories", [])
 
-        # Najdi předchozího assignee z changelogu
         previous_assignee = self._find_previous_assignee(changelog)
 
-        # Komentáře
         comments = []
         for c in fields.get("comment", {}).get("comments", []):
             comments.append({
@@ -105,7 +187,6 @@ class JiraClient:
                 "created": c.get("created", ""),
             })
 
-        # Komponenta → BB repo slug
         components = [comp.get("name", "") for comp in fields.get("components", [])]
 
         return {
@@ -119,7 +200,7 @@ class JiraClient:
             "reporter_account_id": (fields.get("reporter") or {}).get("accountId", ""),
             "previous_assignee": previous_assignee,
             "components": components,
-            "repo_slug": components[0] if components else "",   # první komponenta = repo
+            "repo_slug": components[0] if components else "",
             "comments": comments,
             "labels": fields.get("labels", []),
             "priority": (fields.get("priority") or {}).get("name", ""),
@@ -134,7 +215,7 @@ class JiraClient:
         for history in reversed(changelog):
             for item in history.get("items", []):
                 if item.get("field") == "assignee":
-                    from_account = item.get("from")  # account_id předchozího
+                    from_account = item.get("from")
                     from_string = item.get("fromString", "")
                     if from_account and byte_email.lower() not in from_string.lower():
                         return {
