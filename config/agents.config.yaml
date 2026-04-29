@@ -1,0 +1,123 @@
+# =============================================================================
+# AGENTS CONFIG — netdirect.cz
+# =============================================================================
+# Tento soubor JE v gitu. Neobsahuje žádné tajné hodnoty.
+# Tajné hodnoty → .env lokálně / Railway Environment Variables
+#
+# Pravidlo: začíná na sk-, ATB-, ATATT, client_secret, password → do .env
+# =============================================================================
+
+models:
+  default: &default_model
+    provider: anthropic
+    model: claude-sonnet-4-6
+    max_tokens: 4096
+    temperature: 0.2
+
+  fast: &fast_model
+    provider: anthropic
+    model: claude-haiku-4-5-20251001
+    max_tokens: 1024
+    temperature: 0.1
+
+  precise: &precise_model
+    provider: anthropic
+    model: claude-opus-4-6
+    max_tokens: 8192
+    temperature: 0.1
+
+atlassian:
+  jira_base_url: "https://netdirect.atlassian.net"
+  bitbucket_workspace: "netdirect"
+
+agents:
+  byte:
+    enabled: true
+    model: *default_model
+    jira:
+      email: "agent+byte@netdirect.cz"
+      token_expires: ""
+      allowed_projects: []
+    bitbucket:
+      email: "agent+byte@netdirect.cz"
+      auth_method: "oauth2"
+    teams: ~
+
+  atlas:
+    enabled: false
+    model: *precise_model
+    jira:
+      email: "agent+atlas@netdirect.cz"
+      token_expires: ""
+      allowed_projects: []
+    bitbucket: ~
+    teams: ~
+
+  lucy:
+    enabled: false
+    model: *fast_model
+    jira:
+      email: "agent+lucy@netdirect.cz"
+      token_expires: ""
+      allowed_projects: []
+    bitbucket: ~
+    teams:
+      tenant_id: ""
+
+byte_config:
+  jira_statuses:
+    chat_mode: ["To Do", "Backlog", "Open", "In Review"]
+    programming_mode: ["In Progress"]
+    done: ["Ready to test", "Done", "Closed"]
+
+  triggers:
+    on_assign: "chat"
+    on_in_progress: "program"
+    on_mention: "respond"
+    on_comment_keywords:
+      program: ["zapracuj komentáře", "oprav", "fix", "update"]
+      review:  ["review", "zkontroluj", "CR", "code review"]
+      qa:      ["qa", "otestuj", "test", "bug"]
+
+  skip_branches:
+    exact: ["release", "main", "master", "develop"]
+    prefix: ["release/", "hotfix/"]
+    suffix: ["/release"]
+
+  branch_pattern: "byte/{ticket-id}-{slug}"
+
+  ignored_files:
+    - "package-lock.json"
+    - "yarn.lock"
+    - "pnpm-lock.yaml"
+    - "composer.lock"
+    - "poetry.lock"
+    - "*.min.js"
+    - "*.min.css"
+    - "*.generated.cs"
+    - "*.Designer.cs"
+
+  limits:
+    max_lines_review: 1500
+    max_jira_comment_length: 3000
+    rate_limit_per_hour: 30
+
+  memory:
+    global_repo: "byte-memory"
+    global_path: "global/pamet.md"
+    project_path: "projects/{slug}/pamet.md"
+
+  self_documentation:
+    enabled: true
+    log_path: "projects/{slug}/log.md"
+
+server:
+  host: "0.0.0.0"
+  port: 8000
+  log_level: "info"
+
+forge:
+  app_name: "byte-trigger"
+  events:
+    - "avi:jira:issue:updated"
+    - "avi:jira:issue:commented"

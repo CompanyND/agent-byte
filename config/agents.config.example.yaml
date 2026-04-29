@@ -1,0 +1,82 @@
+# =============================================================================
+# AGENTS CONFIG EXAMPLE — bezpečná šablona pro git
+# =============================================================================
+# Zkopíruj jako agents.config.yaml a vyplň reálné hodnoty.
+# Tento soubor (*.example.yaml) je v gitu. agents.config.yaml NENÍ.
+# =============================================================================
+
+models:
+  default: &default_model
+    provider: anthropic
+    model: claude-sonnet-4-6
+    max_tokens: 4096
+    temperature: 0.2
+
+  fast: &fast_model
+    provider: anthropic
+    model: claude-haiku-4-5-20251001
+    max_tokens: 1024
+    temperature: 0.1
+
+  precise: &precise_model
+    provider: anthropic
+    model: claude-opus-4-6
+    max_tokens: 8192
+    temperature: 0.1
+
+anthropic:
+  api_key: "sk-ant-CHANGE_ME"
+
+agents:
+  byte:
+    enabled: true
+    model: *default_model
+    jira:
+      base_url: "https://FIRMA.atlassian.net"
+      email: "byte@firma.cz"
+      api_token: "ATATT3x_CHANGE_ME"
+      token_expires: "YYYY-MM-DD"
+      allowed_projects: []
+    bitbucket:
+      workspace: "FIRMA_WORKSPACE"
+      email: "byte@firma.cz"
+      app_password: "ATB_CHANGE_ME"
+      allowed_repos: []
+    teams: ~
+
+  atlas:
+    enabled: false
+    model: *precise_model
+    jira:
+      base_url: "https://FIRMA.atlassian.net"
+      email: "atlas@firma.cz"
+      api_token: ""
+      token_expires: ""
+      allowed_projects: []
+    bitbucket: ~
+    teams: ~
+
+  lucy:
+    enabled: false
+    model: *fast_model
+    jira:
+      base_url: "https://FIRMA.atlassian.net"
+      email: "lucy@firma.cz"
+      api_token: ""
+      token_expires: ""
+      allowed_projects: []
+    bitbucket: ~
+    teams:
+      tenant_id: ""
+      client_id: ""
+      client_secret: ""
+      webhook_secret: ""
+
+webhooks:
+  jira_secret: "CHANGE_ME"
+  bitbucket_secret: "CHANGE_ME"
+
+server:
+  host: "0.0.0.0"
+  port: 8000
+  log_level: "info"
