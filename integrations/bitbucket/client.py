@@ -233,11 +233,18 @@ class BitbucketClient:
     # -------------------------------------------------------------------------
 
     async def create_branch(self, repo_slug: str, branch_name: str, from_branch: str = "main") -> bool:
-        """Vytvoří novou branch."""
+        """Vytvoří novou branch. Pokud už existuje, použije ji."""
         token = await self._get_token()
-        # Nejdřív zjisti hash HEAD commitu na zdrojové branchi
-        url = f"{BB_API}/repositories/{self._workspace}/{repo_slug}/refs/branches/{from_branch}"
         async with httpx.AsyncClient() as client:
+            # Zkontroluj jestli branch už existuje
+            check_url = f"{BB_API}/repositories/{self._workspace}/{repo_slug}/refs/branches/{branch_name}"
+            check_resp = await client.get(check_url, headers=self._headers(token), timeout=10)
+            if check_resp.is_success:
+                logger.info(f"[BB] Branch '{branch_name}' už existuje v {repo_slug} — použiji ji")
+                return True
+
+            # Branch neexistuje — zjisti hash HEAD commitu na zdrojové branchi
+            url = f"{BB_API}/repositories/{self._workspace}/{repo_slug}/refs/branches/{from_branch}"
             resp = await client.get(url, headers=self._headers(token), timeout=10)
             if not resp.is_success:
                 logger.error(f"[BB] Branch '{from_branch}' nenalezena v {repo_slug}")

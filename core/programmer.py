@@ -84,18 +84,24 @@ class ByteProgrammer:
 
         logger.info(f"[Programmer] {issue_key} | repo: {repo_slug} | stack: {stack}")
 
-        # 3. Oznámení do Jiry — Byte začíná
+        # 3. Sestavení branch name a zjištění výchozí branch
         branch_name = self._make_branch_name(issue_key, ticket_ctx.get("summary", ""))
         stack_str = self._format_stack(stack)
-        await self._jira.add_comment(
-            issue_key,
-            f"Začínám.\n\nStack: {stack_str}\nBranch: `{branch_name}`\n\nVrátím se s PR."
-        )
-
-        # 4. Zjisti výchozí branch repozitáře
         default_branch = await self._get_default_branch(repo_slug) or "main"
 
-        # 5. Vytvoř branch
+        # 4. Zkontroluj jestli PR už existuje pro tento ticket
+        existing_pr = await self._find_existing_pr(repo_slug, branch_name)
+        if existing_pr:
+            logger.info(f"[Programmer] PR #{existing_pr['id']} už existuje pro {issue_key} — pokračuji na existující branch")
+            # Nepřidáváme "Začínám" komentář, jen pracujeme dál na existující branch
+        else:
+            # Oznámení do Jiry — Byte začíná
+            await self._jira.add_comment(
+                issue_key,
+                f"Začínám.\n\nStack: {stack_str}\nBranch: `{branch_name}`\n\nVrátím se s PR."
+            )
+
+        # 5. Vytvoř branch (nebo použij existující)
         branch_ok = await self._bb.create_branch(repo_slug, branch_name, default_branch)
         if not branch_ok:
             await self._jira.add_comment(
@@ -414,9 +420,13 @@ Zapracuj výše uvedené PR komentáře. Odpověz POUZE validním JSON:
     # -------------------------------------------------------------------------
 
     def _make_branch_name(self, issue_key: str, summary: str) -> str:
-        """Vytvoří název branché: byte/ND-423-payment-refactor"""
+        """Vytvoří název branché: byte/ND-423-pridej-readme-md (bez diakritiky)"""
+        import unicodedata
+        # Odstraň diakritiku: č→c, ř→r, š→s, ž→z atd.
+        normalized = unicodedata.normalize("NFKD", summary)
+        ascii_text = normalized.encode("ascii", "ignore").decode("ascii")
         pattern = cfg.byte.branch_pattern
-        slug = re.sub(r"[^a-z0-9]+", "-", summary.lower())[:40].strip("-")
+        slug = re.sub(r"[^a-z0-9]+", "-", ascii_text.lower())[:40].strip("-")
         return pattern.replace("{ticket-id}", issue_key.upper()).replace("{slug}", slug)
 
     def _format_stack(self, stack: dict) -> str:
@@ -428,6 +438,24 @@ Zapracuj výše uvedené PR komentáře. Odpověz POUZE validním JSON:
         if stack.get("php"):
             parts.append(f"PHP {stack['php']}")
         return " | ".join(parts) if parts else "neznámý"
+
+    async def _find_existing_pr(self, repo_slug: str, branch_name: str) -> Optional[dict]:
+        """Najde existující PR pro danou branch."""
+        token = await self._bb._get_token()
+        url = f"https://api.bitbucket.org/2.0/repositories/{self._bb._workspace}/{repo_slug}/pullrequests"
+        params = {"state": "OPEN", "q": f'source.branch.name="{branch_name}"'}
+        import httpx
+        async with httpx.AsyncClient() as client:
+            resp = await client.get(
+                url,
+                params=params,
+                headers={"Authorization": f"Bearer {token}"},
+                timeout=10,
+            )
+            if resp.is_success:
+                prs = resp.json().get("values", [])
+                return prs[0] if prs else None
+        return None
 
     async def _get_default_branch(self, repo_slug: str) -> Optional[str]:
         """Zjistí výchozí branch repozitáře."""
