@@ -28,7 +28,7 @@ models:
 
 atlassian:
   jira_base_url: "https://netdirect.atlassian.net"
-  bitbucket_workspace: "netdirect"
+  bitbucket_workspace: "netdirect-custom-solution"
 
 agents:
   byte:
