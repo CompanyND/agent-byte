@@ -160,7 +160,7 @@ class Config:
             j = raw["jira"]
             jira = JiraConfig(
                 base_url=self.jira_base_url,
-                email=j.get("email", ""),
+                email=self._env(f"{slug_upper}_JIRA_EMAIL") or j.get("email", ""),
                 api_token=self._env(f"{slug_upper}_JIRA_API_TOKEN"),
                 token_expires=j.get("token_expires") or None,
                 allowed_projects=j.get("allowed_projects") or [],
