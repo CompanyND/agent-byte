@@ -170,17 +170,17 @@ class ByteProgrammer:
         # 9. Přepni Jira ticket na Ready to test
         await self._jira.transition(issue_key, "Ready to test")
 
-        # 10. Závěrečný komentář do Jiry
+        # 10. Závěrečný komentář do Jiry — s formátováním
         reviewer_name = (ticket_ctx.get("previous_assignee") or {}).get("display_name", "reviewer")
-        await self._jira.add_comment(
+        pr_number = pr.get("id", "")
+        await self._jira.add_comment_adf(
             issue_key,
-            f"✅ Hotovo.\n\n"
-            f"**PR:** {pr_url}\n"
-            f"**Branch:** `{branch_name}` → `{default_branch}`\n"
-            f"**Reviewer:** {reviewer_name}\n\n"
-            f"{code_result.get('summary', '')}\n\n"
-            f"Pokud máš připomínky, napiš je do PR komentářů a sem napiš "
-            f"`zapracuj komentáře`."
+            pr_url=pr_url,
+            pr_number=pr_number,
+            branch_name=branch_name,
+            default_branch=default_branch,
+            reviewer_name=reviewer_name,
+            summary=code_result.get("summary", ""),
         )
 
         # 11. Samo-dokumentace

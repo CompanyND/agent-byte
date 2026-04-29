@@ -261,6 +261,101 @@ class JiraClient:
             logger.error(f"[Jira] add_comment {issue_key} selhalo: {resp.status_code} {resp.text[:200]}")
             return False
 
+    async def add_comment_adf(
+        self,
+        issue_key: str,
+        pr_url: str,
+        pr_number: int,
+        branch_name: str,
+        default_branch: str,
+        reviewer_name: str,
+        summary: str,
+    ) -> bool:
+        """
+        Přidá závěrečný komentář Byte s plným ADF formátováním:
+        - PR jako klikatelný odkaz
+        - branch jako inline kód
+        - 'zapracuj komentáře' tučně a zeleně
+        """
+        url = self._url(f"issue/{issue_key}/comment")
+
+        payload = {
+            "body": {
+                "type": "doc",
+                "version": 1,
+                "content": [
+                    # ✅ Hotovo
+                    {
+                        "type": "paragraph",
+                        "content": [
+                            {"type": "text", "text": "✅ Hotovo."}
+                        ]
+                    },
+                    # PR odkaz
+                    {
+                        "type": "paragraph",
+                        "content": [
+                            {"type": "text", "text": "PR: ", "marks": [{"type": "strong"}]},
+                            {
+                                "type": "text",
+                                "text": f"PR #{pr_number}",
+                                "marks": [{"type": "link", "attrs": {"href": pr_url}}]
+                            }
+                        ]
+                    },
+                    # Branch
+                    {
+                        "type": "paragraph",
+                        "content": [
+                            {"type": "text", "text": "Branch: ", "marks": [{"type": "strong"}]},
+                            {"type": "text", "text": branch_name, "marks": [{"type": "code"}]},
+                            {"type": "text", "text": " → "},
+                            {"type": "text", "text": default_branch, "marks": [{"type": "code"}]},
+                        ]
+                    },
+                    # Reviewer
+                    {
+                        "type": "paragraph",
+                        "content": [
+                            {"type": "text", "text": "Reviewer: ", "marks": [{"type": "strong"}]},
+                            {"type": "text", "text": reviewer_name}
+                        ]
+                    },
+                    # Summary
+                    {
+                        "type": "paragraph",
+                        "content": [{"type": "text", "text": summary}]
+                    },
+                    # Instrukce — zapracuj komentáře zeleně
+                    {
+                        "type": "paragraph",
+                        "content": [
+                            {"type": "text", "text": "Pokud máš připomínky, napiš je do PR komentářů a sem napiš "},
+                            {
+                                "type": "text",
+                                "text": "zapracuj komentáře",
+                                "marks": [
+                                    {"type": "strong"},
+                                    {"type": "textColor", "attrs": {"color": "#00875A"}}
+                                ]
+                            },
+                            {"type": "text", "text": "."}
+                        ]
+                    },
+                ]
+            }
+        }
+
+        async with httpx.AsyncClient() as client:
+            resp = await client.post(
+                url, json=payload, auth=self._auth, timeout=15
+            )
+            if resp.is_success:
+                logger.info(f"[Jira] Závěrečný komentář přidán do {issue_key}")
+                return True
+            logger.error(f"[Jira] add_comment_adf {issue_key} selhalo: {resp.status_code} {resp.text[:200]}")
+            return False
+
     # -------------------------------------------------------------------------
     # Přechody stavů
     # -------------------------------------------------------------------------
