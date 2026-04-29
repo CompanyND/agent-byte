@@ -82,3 +82,13 @@ async def debug_run(issue_key: str):
     programmer = ByteProgrammer()
     asyncio.create_task(programmer.run(issue_key))
     return {"status": "started", "issue": issue_key}
+
+
+@app.post("/admin/reload-personas")
+async def reload_personas():
+    """
+    Vynutí znovu načtení SOUL.md, PERSONA.md a skills z BB ai-personas repo.
+    Volej po každé změně osobnosti Byte — bez restartu Railway service.
+    """
+    get_byte().reload_personas()
+    return {"status": "ok", "message": "Personas budou znovu načteny při příštím volání."}

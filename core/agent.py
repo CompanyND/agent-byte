@@ -1,13 +1,14 @@
 """
 core/agent.py — Byte AgentRunner.
 
+Personas se načítají za běhu z BB API (ai-personas repo v Bitbucket).
+Žádná závislost na lokálním filesystému — Railway deployuje jen kód.
+
 System prompt = 4 vrstvy:
   1. SOUL.md       — kdo jsem v jádru
   2. PERSONA.md    — jak se chovám
   3. skill.md      — co dělám teď (review / qa / developer)
-  4. Paměti        — globální + projektová
-
-Pak přijde kontext ticketu + zadání jako user message.
+  4. Paměti        — globální + projektová (z byte-memory repo)
 """
 
 from __future__ import annotations
@@ -15,7 +16,6 @@ from __future__ import annotations
 import asyncio
 import logging
 import anthropic
-from pathlib import Path
 from dataclasses import dataclass
 from typing import Optional
 
@@ -23,8 +23,8 @@ from core.config import cfg
 
 logger = logging.getLogger(__name__)
 
-# Cesta k ai-personas repo (lokální klon nebo načtené z BB)
-PERSONAS_PATH = Path("ai-personas")
+# BB repozitář kde žijí osobnosti všech agentů
+PERSONAS_REPO = "ai-personas"
 
 
 @dataclass
@@ -35,92 +35,130 @@ class ByteTask:
     ticket_description: str
     ticket_status: str
     acceptance_criteria: str
-    repo_slug: str                          # z Jira komponenty
-    previous_assignee: Optional[dict]       # pro PR reviewer
+    repo_slug: str
+    previous_assignee: Optional[dict]
     comments: list[dict]
-    stack: dict                             # {"angular": "17", "dotnet": "net8.0"}
+    stack: dict
     global_memory: str
     project_memory: str
-    action: str                             # "chat", "program", "review", "qa", "fix"
-    extra_context: str = ""                 # např. PR komentáře při opravě
+    action: str                   # "chat", "program", "review", "qa", "fix"
+    extra_context: str = ""
 
 
 @dataclass
 class ByteResponse:
-    """Výstup Byte — co říká a co udělat dál."""
-    content: str                            # text odpovědi / komentáře
-    action: str                             # "jira_comment", "create_pr", "log_only"
+    """Výstup Byte."""
+    content: str
+    action: str
     metadata: dict
 
 
 class ByteAgent:
     """
     Byte — senior developer + QA tester.
-    Načítá osobnost z ai-personas repo, paměť z byte-memory repo.
+    Načítá osobnost z ai-personas BB repo za běhu.
     """
 
     def __init__(self):
         self._client = anthropic.Anthropic(api_key=cfg.anthropic_api_key)
         self._model_cfg = cfg.agent("byte").model
-        self._soul = self._load_persona_file("SOUL.md")
-        self._persona = self._load_persona_file("PERSONA.md")
-        self._skills = {
-            "review": self._load_persona_file("skills/REVIEW.md"),
-            "qa": self._load_persona_file("skills/QA.md"),
+
+        # Cache pro personas — načtou se při prvním použití
+        self._soul: Optional[str] = None
+        self._persona: Optional[str] = None
+        self._skills: dict[str, Optional[str]] = {
+            "review": None,
+            "qa": None,
         }
+        self._personas_loaded = False
+
         logger.info(f"[Byte] Inicializován — model: {self._model_cfg.model}")
 
-    def _load_persona_file(self, relative_path: str) -> str:
-        """Načte soubor z ai-personas/byte/."""
-        path = PERSONAS_PATH / "byte" / relative_path
-        if path.exists():
-            return path.read_text(encoding="utf-8")
-        logger.warning(f"[Byte] Persona soubor nenalezen: {path}")
-        return ""
+    async def _load_personas(self):
+        """
+        Načte personas z BB ai-personas repo.
+        Volá se lazy — při prvním process() volání.
+        Cachuje výsledky — BB API se volá jen jednou za restart.
+        """
+        if self._personas_loaded:
+            return
+
+        # Import zde aby nedošlo k circular importu
+        from integrations.bitbucket.client import BitbucketClient
+        bb = BitbucketClient()
+
+        logger.info("[Byte] Načítám personas z BB ai-personas repo...")
+
+        # Paralelní načítání všech souborů
+        results = await asyncio.gather(
+            bb.get_file(PERSONAS_REPO, "byte/SOUL.md"),
+            bb.get_file(PERSONAS_REPO, "byte/PERSONA.md"),
+            bb.get_file(PERSONAS_REPO, "byte/skills/REVIEW.md"),
+            bb.get_file(PERSONAS_REPO, "byte/skills/QA.md"),
+            return_exceptions=True,
+        )
+
+        soul, persona, review_skill, qa_skill = results
+
+        self._soul = soul if isinstance(soul, str) else ""
+        self._persona = persona if isinstance(persona, str) else ""
+        self._skills["review"] = review_skill if isinstance(review_skill, str) else ""
+        self._skills["qa"] = qa_skill if isinstance(qa_skill, str) else ""
+        self._personas_loaded = True
+
+        loaded = [
+            f"SOUL({'ok' if self._soul else 'CHYBÍ'})",
+            f"PERSONA({'ok' if self._persona else 'CHYBÍ'})",
+            f"REVIEW({'ok' if self._skills['review'] else 'CHYBÍ'})",
+            f"QA({'ok' if self._skills['qa'] else 'CHYBÍ'})",
+        ]
+        logger.info(f"[Byte] Personas načteny: {', '.join(loaded)}")
+
+        if not self._soul or not self._persona:
+            logger.warning(
+                "[Byte] SOUL.md nebo PERSONA.md chybí v ai-personas repo! "
+                "Nahraj soubory do: bitbucket.org/netdirect-custom-solution/ai-personas"
+            )
 
     def _build_system_prompt(self, task: ByteTask) -> str:
-        """
-        Sestaví system prompt ze 4 vrstev.
-        Pořadí: SOUL → PERSONA → skill → paměti
-        """
+        """Sestaví system prompt ze 4 vrstev."""
         parts = []
 
-        # Vrstva 1 — SOUL
         if self._soul:
             parts.append(self._soul)
 
-        # Vrstva 2 — PERSONA
         if self._persona:
             parts.append(self._persona)
 
-        # Vrstva 3 — aktivní skill
-        skill = self._resolve_skill(task.action)
-        if skill and self._skills.get(skill):
-            parts.append(f"---\n## Aktivní skill: {skill}\n\n{self._skills[skill]}")
+        skill_name = self._resolve_skill(task.action)
+        if skill_name and self._skills.get(skill_name):
+            parts.append(
+                f"---\n## Aktivní skill: {skill_name}\n\n{self._skills[skill_name]}"
+            )
 
-        # Vrstva 4 — paměti
         if task.global_memory:
             parts.append(f"---\n## Globální paměť\n\n{task.global_memory}")
+
         if task.project_memory:
-            parts.append(f"---\n## Projektová paměť ({task.repo_slug})\n\n{task.project_memory}")
+            parts.append(
+                f"---\n## Projektová paměť ({task.repo_slug})\n\n{task.project_memory}"
+            )
 
         return "\n\n".join(filter(None, parts))
 
     def _resolve_skill(self, action: str) -> Optional[str]:
-        mapping = {
+        return {
             "review": "review",
             "qa": "qa",
-            "program": None,    # programování nepoužívá extra skill, PERSONA stačí
+            "fix": "review",
+            "program": None,
             "chat": None,
-            "fix": "review",    # při opravě použij review skill jako kontext
-        }
-        return mapping.get(action)
+        }.get(action)
 
     def _build_user_message(self, task: ByteTask) -> str:
-        """Sestaví user message s celým kontextem ticketu."""
         lines = []
 
-        # Stack kontext
+        # Stack
         stack_parts = []
         if task.stack.get("angular"):
             stack_parts.append(f"Angular {task.stack['angular']}")
@@ -143,13 +181,12 @@ class ByteAgent:
 
         if task.comments:
             lines.append("\n**Komentáře v ticketu:**")
-            for c in task.comments[-10:]:  # posledních 10 komentářů
+            for c in task.comments[-10:]:
                 lines.append(f"  [{c['author']}]: {c['body'][:500]}")
 
         if task.extra_context:
             lines.append(f"\n**Dodatečný kontext:**\n{task.extra_context}")
 
-        # Akce
         action_instructions = {
             "chat": (
                 "\n**Akce:** Jsem v CHAT režimu (ticket není In Progress). "
@@ -159,12 +196,8 @@ class ByteAgent:
                 "\n**Akce:** Ticket je In Progress. Začni programovat. "
                 "Napiš co uděláš (branch, přístup) a případné otázky než začneš."
             ),
-            "review": (
-                "\n**Akce:** Proveď code review dle REVIEW skill pravidel."
-            ),
-            "qa": (
-                "\n**Akce:** Proveď QA testování dle QA skill pravidel."
-            ),
+            "review": "\n**Akce:** Proveď code review dle REVIEW skill pravidel.",
+            "qa": "\n**Akce:** Proveď QA testování dle QA skill pravidel.",
             "fix": (
                 "\n**Akce:** Zapracuj komentáře z PR. "
                 "Přečti je, shrň co opravíš a začni."
@@ -177,6 +210,10 @@ class ByteAgent:
 
     async def process(self, task: ByteTask) -> ByteResponse:
         """Hlavní vstupní bod — zpracuje úkol a vrátí odpověď."""
+
+        # Lazy load personas z BB
+        await self._load_personas()
+
         system_prompt = self._build_system_prompt(task)
         user_message = self._build_user_message(task)
 
@@ -193,39 +230,36 @@ class ByteAgent:
         )
 
         content = response.content[0].text
-        output_action = self._resolve_output_action(task.action)
+        input_tokens = response.usage.input_tokens
+        output_tokens = response.usage.output_tokens
 
         logger.info(
             f"[Byte] {task.ticket_id} hotovo | "
-            f"tokeny: in={response.usage.input_tokens} out={response.usage.output_tokens}"
+            f"tokeny: in={input_tokens} out={output_tokens}"
         )
 
         return ByteResponse(
             content=content,
-            action=output_action,
+            action="jira_comment",
             metadata={
                 "ticket_id": task.ticket_id,
                 "task_action": task.action,
                 "model": self._model_cfg.model,
-                "input_tokens": response.usage.input_tokens,
-                "output_tokens": response.usage.output_tokens,
+                "input_tokens": input_tokens,
+                "output_tokens": output_tokens,
                 "stack": task.stack,
             },
         )
 
-    def _resolve_output_action(self, task_action: str) -> str:
-        mapping = {
-            "chat": "jira_comment",
-            "program": "jira_comment",     # oznámení že začíná + branch
-            "review": "jira_comment",
-            "qa": "jira_comment",
-            "fix": "jira_comment",
-        }
-        return mapping.get(task_action, "jira_comment")
+    def reload_personas(self):
+        """Vynutí znovu načtení personas z BB — volej po změně SOUL.md nebo PERSONA.md."""
+        self._personas_loaded = False
+        logger.info("[Byte] Personas cache invalidována — znovu načtou se při příštím volání.")
 
 
 # Singleton
 _byte: Optional[ByteAgent] = None
+
 
 def get_byte() -> ByteAgent:
     global _byte
