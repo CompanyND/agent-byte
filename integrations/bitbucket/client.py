@@ -445,24 +445,40 @@ class BitbucketClient:
     # byte-memory repo
     # -------------------------------------------------------------------------
 
-    async def read_memory(self, project_slug: str) -> tuple[str, str]:
+    async def read_memory(self, repo_slug: str, bb_project: str = "") -> tuple[str, str, str]:
         """
-        Načte globální a projektovou paměť z byte-memory repo.
-        Vrátí (global_memory, project_memory).
+        Načte 3 úrovně paměti z byte-memory repo.
+        Vrátí (global_memory, project_memory, repo_memory).
+        
+        repo_slug   = název BB repozitáře (např. "web-frontend")
+        bb_project  = název BB projektu (např. "iftech") — prefix repozitáře
         """
         memory_cfg = cfg.byte.memory
-        global_path = memory_cfg.get("global_path", "global/pamet.md")
-        project_path = memory_cfg.get("project_path", "projects/{slug}/pamet.md").replace(
-            "{slug}", project_slug
-        )
         memory_repo = memory_cfg.get("global_repo", "byte-memory")
 
-        global_mem, project_mem = await asyncio.gather(
+        # Globální paměť
+        global_path = memory_cfg.get("global_path", "global/pamet.md")
+
+        # Projektová paměť — pokud bb_project není zadán, odvoď ho z repo_slug
+        if not bb_project and repo_slug:
+            bb_project = repo_slug.split("_")[0] if "_" in repo_slug else repo_slug.split("-")[0]
+
+        project_path = memory_cfg.get("project_path", "projects/{bb-project}/pamet.md").replace(
+            "{bb-project}", bb_project
+        ).replace("{slug}", bb_project)
+
+        # Repozitářová paměť
+        repo_path = memory_cfg.get("repo_path", "repos/{repo-slug}/pamet.md").replace(
+            "{repo-slug}", repo_slug
+        ).replace("{slug}", repo_slug)
+
+        global_mem, project_mem, repo_mem = await asyncio.gather(
             self.get_file(memory_repo, global_path),
             self.get_file(memory_repo, project_path),
+            self.get_file(memory_repo, repo_path),
         )
 
-        return (global_mem or ""), (project_mem or "")
+        return (global_mem or ""), (project_mem or ""), (repo_mem or "")
 
     async def write_memory(self, project_slug: str, path_key: str, content: str, message: str) -> bool:
         """Zapíše do byte-memory repo."""

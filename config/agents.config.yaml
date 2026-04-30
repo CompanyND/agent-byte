@@ -40,7 +40,7 @@ agents:
     model: *default_model
     jira:
       email: "ai-agent-developers+byte@netdirect.cz"
-      token_expires: ""
+      token_expires: "2027-04-28"
       allowed_projects: []
     bitbucket:
       email: "ai-agent-developers+byte@netdirect.cz"
@@ -52,7 +52,7 @@ agents:
     model: *precise_model
     jira:
       email: "ai-agent-developers+atlas@netdirect.cz"
-      token_expires: ""
+      token_expires: "2027-04-28"
       allowed_projects: []
     bitbucket: ~
     teams: ~
@@ -62,7 +62,7 @@ agents:
     model: *fast_model
     jira:
       email: "ai-agent-developers+lucy@netdirect.cz"
-      token_expires: ""
+      token_expires: "2027-04-28"
       allowed_projects: []
     bitbucket: ~
     teams:

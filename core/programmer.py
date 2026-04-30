@@ -69,18 +69,21 @@ class ByteProgrammer:
 
         repo_slug = ticket_ctx.get("repo_slug", "")
         if not repo_slug:
-            msg = (
-                f"Ticket {issue_key} nemá nastavenou komponentu → nevím na jakém repozitáři pracovat.\n"
-                f"Nastav komponentu v ticketu (komponenta = název BB repozitáře)."
+            await self._report_error(
+                issue_key,
+                "Ticket nemá nastavenou **Komponentu** → nevím na jakém repozitáři pracovat.",
+                "Nastav komponentu v ticketu. Komponenta = přesný název BB repozitáře."
             )
-            await self._jira.add_comment(issue_key, msg)
             return ProgrammingResult(False, message="Chybí komponenta/repo_slug")
 
         # 2. Paralelně: stack + paměti
-        stack, (global_mem, project_mem) = await asyncio.gather(
+        stack, memories = await asyncio.gather(
             self._bb.detect_stack(repo_slug),
             self._bb.read_memory(repo_slug),
         )
+        global_mem = memories[0] if memories else ""
+        project_mem = memories[1] if len(memories) > 1 else ""
+        repo_mem = memories[2] if len(memories) > 2 else ""
 
         logger.info(f"[Programmer] {issue_key} | repo: {repo_slug} | stack: {stack}")
 
@@ -93,6 +96,11 @@ class ByteProgrammer:
         release_branch = await self._get_release_branch(repo_slug, issue_key)
         if not release_branch:
             # Byte se zeptal a čeká — ukončíme cyklus
+            await self._report_error(
+                issue_key,
+                "Nepodařilo se určit release větev pro repozitář `" + repo_slug + "`.",
+                "Buď větev 'release' neexistuje, nebo vypršel timeout čekání na odpověď."
+            )
             return ProgrammingResult(False, message="Čeká na výběr release větve")
         default_branch = release_branch
 
@@ -111,10 +119,10 @@ class ByteProgrammer:
         # 5. Vytvoř branch (nebo použij existující)
         branch_ok = await self._bb.create_branch(repo_slug, branch_name, default_branch)
         if not branch_ok:
-            await self._jira.add_comment(
+            await self._report_error(
                 issue_key,
-                f"❌ Nepodařilo se vytvořit branch `{branch_name}` z `{default_branch}`.\n"
-                f"Zkontroluj prosím přístupy Byte k repozitáři `{repo_slug}`."
+                f"Nepodařilo se vytvořit branch `{branch_name}` z `{default_branch}`.",
+                f"Zkontroluj přístupy Byte k repozitáři `{repo_slug}`."
             )
             return ProgrammingResult(False, message="Branch creation failed")
 
@@ -144,9 +152,10 @@ class ByteProgrammer:
         )
 
         if not commit_ok:
-            await self._jira.add_comment(
+            await self._report_error(
                 issue_key,
-                "❌ Commit selhal. Zkontroluj prosím přístupy Byte k repozitáři."
+                "Commit selhal.",
+                f"Zkontroluj přístupy Byte k repozitáři `{repo_slug}`."
             )
             return ProgrammingResult(False, message="Commit failed")
 
@@ -210,6 +219,17 @@ class ByteProgrammer:
         logger.info(f"[Programmer] {issue_key} dokončeno — PR #{pr_id}: {pr_url}")
         return ProgrammingResult(True, branch=branch_name, pr_url=pr_url, pr_id=pr_id)
 
+    async def _report_error(self, issue_key: str, message: str, context: str = ""):
+        """Napíše chybový komentář do Jiry — aby vývojář věděl co se stalo."""
+        full_message = f"❌ **Chyba při zpracování ticketu**\n\n{message}"
+        if context:
+            full_message += f"\n\n**Detail:** `{context}`"
+        full_message += "\n\nOprav problém a přesuň ticket zpět na **In development**."
+        try:
+            await self._jira.add_comment(issue_key, full_message)
+        except Exception as e:
+            logger.error(f"[Programmer] Nepodařilo se zapsat chybu do Jiry: {e}")
+
     # -------------------------------------------------------------------------
     # Opravný cyklus
     # -------------------------------------------------------------------------
@@ -257,10 +277,13 @@ class ByteProgrammer:
 
         # Načti aktuální kontext
         ticket_ctx = await self._jira.get_ticket_context(issue_key)
-        stack, (global_mem, project_mem) = await asyncio.gather(
+        stack, memories = await asyncio.gather(
             self._bb.detect_stack(repo_slug),
             self._bb.read_memory(repo_slug),
         )
+        global_mem = memories[0] if memories else ""
+        project_mem = memories[1] if len(memories) > 1 else ""
+        repo_mem = memories[2] if len(memories) > 2 else ""
 
         # Vygeneruj opravenou verzi
         fix_result = await self._generate_fix(
