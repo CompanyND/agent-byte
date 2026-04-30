@@ -92,27 +92,33 @@ class ByteProgrammer:
         branch_name = self._make_branch_name(issue_key, issue_type)
         stack_str = self._format_stack(stack)
 
-        # Zjisti release větev (výchozí nebo vyber při více možnostech)
+        # Zjisti release větev — z ní se vytvoří branch
         release_branch = await self._get_release_branch(repo_slug, issue_key)
         if not release_branch:
-            # Byte se zeptal a čeká — ukončíme cyklus
             await self._report_error(
                 issue_key,
                 "Nepodařilo se určit release větev pro repozitář `" + repo_slug + "`.",
                 "Buď větev 'release' neexistuje, nebo vypršel timeout čekání na odpověď."
             )
             return ProgrammingResult(False, message="Čeká na výběr release větve")
-        default_branch = release_branch
+
+        # Hlavní branch repozitáře — PR míří sem (master nebo main)
+        main_branch = await self._get_default_branch(repo_slug) or "master"
 
         # 4. Zkontroluj jestli PR už existuje pro tento ticket
         existing_pr = await self._find_existing_pr(repo_slug, branch_name)
         if existing_pr:
             logger.info(f"[Programmer] PR #{existing_pr['id']} už existuje pro {issue_key} — pokračuji na existující branch")
             # Nepřidáváme "Začínám" komentář, jen pracujeme dál na existující branch
-        # Nezasílám "Začínám" komentář — vývojář dostane výsledek až bude hotovo
+        else:
+            # Oznámení do Jiry — Byte začíná
+            await self._jira.add_comment(
+                issue_key,
+                f"Začínám.\n\nStack: {stack_str}\nBranch: `{branch_name}`\n\nVrátím se s PR."
+            )
 
-        # 5. Vytvoř branch (nebo použij existující)
-        branch_ok = await self._bb.create_branch(repo_slug, branch_name, default_branch)
+        # 5. Vytvoř branch Z release větve (nebo použij existující)
+        branch_ok = await self._bb.create_branch(repo_slug, branch_name, release_branch)
         if not branch_ok:
             await self._report_error(
                 issue_key,
@@ -160,7 +166,7 @@ class ByteProgrammer:
             repo_slug=repo_slug,
             title=f"[BYTE] {issue_key} — {ticket_ctx.get('summary', '')[:60]}",
             source_branch=branch_name,
-            destination_branch=default_branch,
+            destination_branch=main_branch,
             description=self._build_pr_description(
                 ticket_ctx, stack, code_result, branch_name
             ),
@@ -197,7 +203,7 @@ class ByteProgrammer:
         comment_lines = [
             "✅ Hotovo",
             "",
-            f"[PR #{pr_number}]({pr_url}) → `{branch_name}`",
+            f"[PR #{pr_number}]({pr_url}) → `{main_branch}`",
             f"Reviewer: {reviewer_name}",
         ]
         if summary:
@@ -632,10 +638,11 @@ Zapracuj výše uvedené PR komentáře. Odpověz POUZE validním JSON:
         jira_url = f"{cfg.jira_base_url}/browse/{issue_key}"
         stack_str = self._format_stack(stack)
 
+        default_branch = ticket_ctx.get("main_branch", "master")
         desc = (
             f"## [{issue_key}]({jira_url}) — {ticket_ctx.get('summary', '')}\n\n"
             f"**Stack:** {stack_str}\n"
-            f"**Branch:** `{branch_name}`\n\n"
+            f"**Branch:** `{branch_name}` → `{default_branch}`\n\n"
             f"---\n\n"
             f"### Co jsem udělal\n{code_result.get('summary', '')}\n\n"
         )
