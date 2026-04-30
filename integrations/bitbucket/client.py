@@ -527,15 +527,9 @@ class BitbucketClient:
         # Limit — pokud je diff příliš velký, zkrátíme
         max_chars = 8000
         if len(filtered_diff) > max_chars:
-            filtered_diff = filtered_diff[:max_chars] + f"
+            filtered_diff = filtered_diff[:max_chars] + f"\n\n... (diff zkrácen, celkem {changed_lines} změněných řádků)"
 
-... (diff zkrácen, celkem {changed_lines} změněných řádků)"
-
-        return f"## PR #{pr_id}: {source_branch} → {dest_branch}
-
-```diff
-{filtered_diff}
-```"
+        return f"## PR #{pr_id}: {source_branch} → {dest_branch}\n\n```diff\n{filtered_diff}\n```"
 
     async def append_log(self, project_slug: str, entry: str) -> bool:
         """Přidá záznam do samo-dokumentačního logu projektu."""
