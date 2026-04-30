@@ -26,12 +26,25 @@ JIRA_ID_PATTERN = re.compile(r"([A-Z]{2,10}-\d+)", re.IGNORECASE)
 
 
 def _verify_forge_secret(body: bytes, signature: str) -> bool:
-    """Ověří HMAC podpis z Forge shared secret."""
+    """
+    Ověří podpis z Forge/Jira Automation shared secret.
+    Podporuje dva formáty:
+    1. Plain secret (Jira Automation): x-forge-signature: <secret>
+    2. HMAC hash (Forge): x-forge-signature: sha256=<hmac>
+    """
     secret = cfg.forge_shared_secret
     if not secret:
         return True  # dev mode — bez ověření
+    if not signature:
+        return False
+
+    # Varianta 1: plain secret (Jira Automation)
+    if hmac.compare_digest(secret, signature):
+        return True
+
+    # Varianta 2: HMAC sha256 (Forge CLI)
     expected = hmac.new(secret.encode(), body, hashlib.sha256).hexdigest()
-    return hmac.compare_digest(f"sha256={expected}", signature or "")
+    return hmac.compare_digest(f"sha256={expected}", signature)
 
 
 def _classify_event(payload: dict) -> tuple[str, dict]:
