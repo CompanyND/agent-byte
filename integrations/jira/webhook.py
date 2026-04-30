@@ -1,8 +1,5 @@
 """
-integrations/jira/webhook.py — Přijímá eventy z Jira Forge.
-
-Forge funkce (v Atlassian cloudu) zavolá tento endpoint při každém
-relevantním Jira eventu. Zde parsujeme, rozhodujeme a spouštíme Byte.
+integrations/jira/webhook.py — Přijímá eventy z Jira Automation.
 """
 
 from __future__ import annotations
@@ -26,82 +23,107 @@ JIRA_ID_PATTERN = re.compile(r"([A-Z]{2,10}-\d+)", re.IGNORECASE)
 
 
 def _verify_forge_secret(body: bytes, signature: str) -> bool:
-    """
-    Ověří podpis z Forge/Jira Automation shared secret.
-    Podporuje dva formáty:
-    1. Plain secret (Jira Automation): x-forge-signature: <secret>
-    2. HMAC hash (Forge): x-forge-signature: sha256=<hmac>
-    """
     secret = cfg.forge_shared_secret
     if not secret:
-        return True  # dev mode — bez ověření
+        return True
     if not signature:
         return False
-
-    # Varianta 1: plain secret (Jira Automation)
     if hmac.compare_digest(secret, signature):
         return True
-
-    # Varianta 2: HMAC sha256 (Forge CLI)
     expected = hmac.new(secret.encode(), body, hashlib.sha256).hexdigest()
     return hmac.compare_digest(f"sha256={expected}", signature)
 
 
 def _classify_event(payload: dict) -> tuple[str, dict]:
     """
-    Klasifikuje Jira event na typ + relevantní data.
-    Vrátí (event_type, data) nebo ("ignore", {}).
+    Klasifikuje Jira event.
+    Podporuje formát Jira Automation (formát Jira) i klasický webhook formát.
     """
-    event = payload.get("eventType", payload.get("webhookEvent", ""))
+    # DEBUG — loguj celý payload pro diagnostiku
+    logger.info(f"[Webhook] Payload keys: {list(payload.keys())}")
+    logger.info(f"[Webhook] Payload preview: {str(payload)[:800]}")
+
+    # Jira Automation "formát Jira" posílá data přímo v rootu
+    # Zkus různé struktury kde může být issue key
+    issue_key = ""
+    new_status = ""
+    assignee_email = ""
+
+    # Varianta A — klasický webhook: payload.issue.key
     issue = payload.get("issue", {})
-    fields = issue.get("fields", {})
-
-    # Přiřazení ticketu na Byte
-    if "updated" in event:
-        changelog = payload.get("changelog", {})
-        for item in changelog.get("items", []):
-            if item.get("field") == "assignee":
-                to_str = item.get("toString", "")
-                if cfg.agent("byte").jira.email.split("@")[0].lower() in to_str.lower():
-                    return "assigned_to_byte", {
-                        "issue_key": issue.get("key", ""),
-                        "new_status": fields.get("status", {}).get("name", ""),
-                    }
-
-            # Přechod do In Progress (ticket je na Byte)
-            if item.get("field") == "status":
-                new_status = item.get("toString", "")
-                assignee_email = (fields.get("assignee") or {}).get("emailAddress", "")
-                if (new_status in cfg.byte.jira_statuses.get("programming_mode", []) and
-                        cfg.agent("byte").jira.email.lower() == assignee_email.lower()):
-                    return "in_progress", {
-                        "issue_key": issue.get("key", ""),
-                        "new_status": new_status,
-                    }
-
-    # Komentář na ticketu přiřazeném Byte
-    if "commented" in event:
+    if issue:
+        issue_key = issue.get("key", "")
+        fields = issue.get("fields", {})
+        new_status = fields.get("status", {}).get("name", "")
         assignee_email = (fields.get("assignee") or {}).get("emailAddress", "")
-        if cfg.agent("byte").jira.email.lower() == assignee_email.lower():
+
+    # Varianta B — Jira Automation formát: issueKey přímo v rootu
+    if not issue_key:
+        issue_key = payload.get("issueKey", payload.get("issue_key", ""))
+
+    # Varianta C — přes transition objekt
+    transition = payload.get("transition", {})
+    if transition and not new_status:
+        new_status = transition.get("to", {}).get("name", "")
+
+    # Varianta D — changelog v rootu
+    changelog = payload.get("changelog", payload.get("log", {}))
+    if isinstance(changelog, dict):
+        items = changelog.get("items", [])
+    else:
+        items = []
+
+    # Varianta E — Jira Automation může poslat stav přímo
+    if not new_status:
+        new_status = (
+            payload.get("status", {}).get("name", "") or
+            payload.get("toStatus", "") or
+            payload.get("transition_to", "")
+        )
+
+    # Varianta F — assignee přímo v rootu
+    if not assignee_email:
+        assignee = payload.get("assignee", {})
+        if isinstance(assignee, dict):
+            assignee_email = assignee.get("emailAddress", assignee.get("email", ""))
+
+    logger.info(f"[Webhook] Parsed — issue: {issue_key} | status: {new_status} | assignee: {assignee_email}")
+
+    byte_email = cfg.agent("byte").jira.email.lower()
+    programming_statuses = cfg.byte.jira_statuses.get("programming_mode", ["In Progress", "Rozpracováno"])
+
+    # Zkontroluj přechod do In Progress
+    if issue_key and new_status in programming_statuses:
+        if not assignee_email or assignee_email.lower() == byte_email:
+            return "in_progress", {"issue_key": issue_key, "new_status": new_status}
+
+    # Zkontroluj changelog items
+    for item in items:
+        if item.get("field") == "status":
+            item_status = item.get("toString", "")
+            if item_status in programming_statuses:
+                if not assignee_email or assignee_email.lower() == byte_email:
+                    return "in_progress", {"issue_key": issue_key, "new_status": item_status}
+
+    # Komentář
+    event = payload.get("eventType", payload.get("webhookEvent", ""))
+    if "commented" in event and issue_key:
+        if not assignee_email or assignee_email.lower() == byte_email:
             comment = payload.get("comment", {})
             body_text = _extract_comment_text(comment.get("body", {}))
             author_email = (comment.get("author") or {}).get("emailAddress", "")
+            if author_email.lower() != byte_email:
+                return "comment_on_byte_ticket", {
+                    "issue_key": issue_key,
+                    "comment_text": body_text,
+                    "author": (comment.get("author") or {}).get("displayName", ""),
+                }
 
-            # Ignoruj vlastní komentáře Byte
-            if author_email.lower() == cfg.agent("byte").jira.email.lower():
-                return "ignore", {}
-
-            return "comment_on_byte_ticket", {
-                "issue_key": issue.get("key", ""),
-                "comment_text": body_text,
-                "author": (comment.get("author") or {}).get("displayName", ""),
-            }
-
+    logger.info(f"[Webhook] Ignoruji — issue: {issue_key} | status: '{new_status}' | assignee: '{assignee_email}'")
     return "ignore", {}
 
 
 def _extract_comment_text(body) -> str:
-    """Extrahuje text z ADF nebo string."""
     if isinstance(body, str):
         return body
     if isinstance(body, dict):
@@ -121,39 +143,28 @@ def _extract_node_text(node: dict) -> str:
 
 
 def _resolve_action(event_type: str, comment_text: str = "") -> str:
-    """Rozhodne jakou akci Byte provede."""
     if event_type == "in_progress":
         return "program"
 
     if event_type in ("assigned_to_byte", "comment_on_byte_ticket"):
-        # Zkontroluj klíčová slova v komentáři
         comment_lower = comment_text.lower()
         triggers = cfg.byte.triggers.get("on_comment_keywords", {})
-
         for action, keywords in triggers.items():
             if any(kw.lower() in comment_lower for kw in keywords):
                 return action
-
-        # Výchozí — chat
         return "chat"
 
     return "chat"
 
 
 async def _process_event(event_type: str, event_data: dict):
-    """
-    Zpracuje event asynchronně — sestaví kontext a spustí Byte.
-    Běží na pozadí (background task).
-    """
     issue_key = event_data.get("issue_key", "")
     if not issue_key:
         return
 
     jira = JiraClient()
     bb = BitbucketClient()
-    byte = get_byte()
 
-    # Načti kontext ticketu
     ticket_ctx = await jira.get_ticket_context(issue_key)
     if not ticket_ctx:
         logger.error(f"[Webhook] Nepodařilo se načíst ticket {issue_key}")
@@ -165,7 +176,14 @@ async def _process_event(event_type: str, event_data: dict):
 
     logger.info(f"[Webhook] {issue_key} | event: {event_type} | akce: {action} | repo: {repo_slug}")
 
-    # Paralelní načítání: stack + paměti
+    # Pokud je akce "program" → spusť programmer
+    if action == "program":
+        from core.programmer import ByteProgrammer
+        programmer = ByteProgrammer()
+        asyncio.create_task(programmer.run(issue_key))
+        return
+
+    # Jinak — chat / review / qa přes agent
     stack = {}
     global_memory, project_memory = "", ""
 
@@ -174,16 +192,8 @@ async def _process_event(event_type: str, event_data: dict):
             bb.detect_stack(repo_slug),
             bb.read_memory(repo_slug),
         )
-    else:
-        logger.warning(f"[Webhook] {issue_key} nemá nastavenou komponentu → repo_slug prázdný")
 
-    # Extra kontext pro fix akci — načti PR komentáře
-    extra_context = ""
-    if action == "fix" and repo_slug:
-        # TODO: načíst PR komentáře z BB — implementace v dalším kroku
-        extra_context = comment_text
-
-    # Sestav úkol pro Byte
+    byte = get_byte()
     task = ByteTask(
         ticket_id=issue_key,
         ticket_summary=ticket_ctx.get("summary", ""),
@@ -197,43 +207,28 @@ async def _process_event(event_type: str, event_data: dict):
         global_memory=global_memory,
         project_memory=project_memory,
         action=action,
-        extra_context=extra_context,
+        extra_context=comment_text if action == "fix" else "",
     )
 
-    # Spusť Byte
     response = await byte.process(task)
 
-    # Odešli odpověď do Jiry
     if response.action == "jira_comment":
         await jira.add_comment(issue_key, response.content)
 
-    # Přechod stavu pokud programuje
-    if action == "program":
-        # Byte začíná — oznámí branch a začíná pracovat
-        # Skutečný commit/PR přijde v dalším kroku (core/programmer.py)
-        pass
-
-    # Samo-dokumentace
     if repo_slug:
         log_entry = (
-            f"**{issue_key}** | akce: {action} | "
-            f"stack: {stack} | "
+            f"**{issue_key}** | akce: {action} | stack: {stack} | "
             f"tokeny: {response.metadata.get('input_tokens', 0) + response.metadata.get('output_tokens', 0)}"
         )
         await bb.append_log(repo_slug, log_entry)
 
-    logger.info(f"[Webhook] {issue_key} zpracováno | tokeny: {response.metadata}")
+    logger.info(f"[Webhook] {issue_key} zpracováno")
 
 
 @router.post("/jira")
 async def handle_jira_event(request: Request):
-    """
-    Hlavní endpoint pro Jira Forge eventy.
-    Forge manifest.yml → trigger → tento endpoint.
-    """
     raw_body = await request.body()
 
-    # Ověř Forge podpis
     signature = request.headers.get("x-forge-signature", "")
     if not _verify_forge_secret(raw_body, signature):
         raise HTTPException(status_code=401, detail="Invalid Forge signature")
@@ -244,19 +239,12 @@ async def handle_jira_event(request: Request):
     if event_type == "ignore":
         return {"status": "ignored"}
 
-    # Zpracuj na pozadí — Forge má timeout 25s, odpovídáme hned
-    import asyncio
     asyncio.create_task(_process_event(event_type, event_data))
 
     return {"status": "accepted", "event": event_type, "issue": event_data.get("issue_key")}
 
 
-# ---------------------------------------------------------------------------
-# Programmer integration — přidáme na konec souboru
-# ---------------------------------------------------------------------------
-
 async def _run_programmer(issue_key: str):
-    """Spustí programovací cyklus na pozadí."""
     from core.programmer import ByteProgrammer
     programmer = ByteProgrammer()
     result = await programmer.run(issue_key)
