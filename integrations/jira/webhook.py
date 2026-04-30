@@ -233,7 +233,17 @@ async def handle_jira_event(request: Request):
     if not _verify_forge_secret(raw_body, signature):
         raise HTTPException(status_code=401, detail="Invalid Forge signature")
 
-    payload = await request.json()
+    # Ochrana proti prázdnému tělu (Jira Automation komentář trigger)
+    if not raw_body or not raw_body.strip():
+        logger.warning("[Webhook] Prázdné tělo requestu — ignoruji")
+        return {"status": "ignored", "reason": "empty body"}
+
+    try:
+        payload = await request.json()
+    except Exception as e:
+        logger.error(f"[Webhook] JSON parse error: {e} | body: {raw_body[:200]}")
+        return {"status": "ignored", "reason": "invalid json"}
+
     event_type, event_data = _classify_event(payload)
 
     if event_type == "ignore":
