@@ -520,8 +520,7 @@ Zapracuj výše uvedené PR komentáře. Odpověz POUZE validním JSON:
         Zeptá se v Jiře na výběr release větve a čeká na odpověď.
         Odpověď rozpozná z dalšího komentáře (číslo 1, 2, 3 nebo název větve).
         """
-        options = "
-".join([f"{i+1}) `{b}`" for i, b in enumerate(branches)])
+        options = "\n".join([f"{i+1}) `{b}`" for i, b in enumerate(branches)])
         await self._jira.add_comment(
             issue_key,
             f"Našel jsem více release větví v `{repo_slug}`:\n\n{options}\n\n"
