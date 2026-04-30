@@ -3,8 +3,6 @@
 # =============================================================================
 # Tento soubor JE v gitu. Neobsahuje žádné tajné hodnoty.
 # Tajné hodnoty → .env lokálně / Railway Environment Variables
-#
-# Pravidlo: začíná na sk-, ATB-, ATATT, client_secret, password → do .env
 # =============================================================================
 
 models:
@@ -13,18 +11,24 @@ models:
     model: claude-sonnet-4-6
     max_tokens: 4096
     temperature: 0.2
+    cost_input_per_1m: 3.00
+    cost_output_per_1m: 15.00
 
   fast: &fast_model
     provider: anthropic
     model: claude-haiku-4-5-20251001
     max_tokens: 1024
     temperature: 0.1
+    cost_input_per_1m: 0.25
+    cost_output_per_1m: 1.25
 
   precise: &precise_model
     provider: anthropic
     model: claude-opus-4-6
     max_tokens: 8192
     temperature: 0.1
+    cost_input_per_1m: 15.00
+    cost_output_per_1m: 75.00
 
 atlassian:
   jira_base_url: "https://netdirect.atlassian.net"
@@ -65,10 +69,19 @@ agents:
       tenant_id: ""
 
 byte_config:
+
   jira_statuses:
-    chat_mode: ["To Do", "Backlog", "Open", "In Review"]
+    chat_mode: ["To Do", "Backlog", "Open", "In Review", "Otevřeno"]
     programming_mode: ["In Progress", "Rozpracováno", "In development"]
     done: ["Ready to test", "Done", "Closed"]
+
+  # Typy ticketů které jdou jako bugfix větev
+  bug_issue_types:
+    - "Bug"
+    - "Chyba"
+    - "Subtask"
+    - "Sub-task"
+    - "Dílčí úkol"
 
   triggers:
     on_assign: "chat"
@@ -79,12 +92,42 @@ byte_config:
       review:  ["review", "zkontroluj", "CR", "code review"]
       qa:      ["qa", "otestuj", "test", "bug"]
 
+  # Branch konvence
+  # feat/{TICKET-ID}   — pro všechny typy kromě Bug/Chyba/Subtask
+  # bugfix/{TICKET-ID} — pro Bug, Chyba, Dílčí úkol
+  branch_pattern:
+    feat: "feat/{ticket-id}"
+    bugfix: "bugfix/{ticket-id}"
+
+  # Výchozí release větev pro všechny repozitáře
+  default_release_branch: "release"
+
+  # Repozitáře s více release větvemi — Byte se zeptá
+  multi_release_repos:
+    iftech_krajiczech-admin:
+      - release/krajiczech
+      - release/master
+    iftech_krajiczech-shop:
+      - release/iftech
+      - release/krajiczech
+    penam-shop:
+      - penam/release
+      - ub-shop/release
+    penam-admin:
+      - penam-admin/release
+      - ub-admin/release
+    elima-jakub-web:
+      - elima/release
+      - jakub/release
+    elima-jakub-admin:
+      - elima/release
+      - jakub/release
+      - release
+
   skip_branches:
-    exact: ["release", "main", "master", "develop"]
+    exact: ["main", "master", "develop"]
     prefix: ["release/", "hotfix/"]
     suffix: ["/release"]
-
-  branch_pattern: "byte/{ticket-id}-{slug}"
 
   ignored_files:
     - "package-lock.json"
@@ -105,11 +148,12 @@ byte_config:
   memory:
     global_repo: "byte-memory"
     global_path: "global/pamet.md"
-    project_path: "projects/{slug}/pamet.md"
+    project_path: "projects/{bb-project}/pamet.md"
+    repo_path: "repos/{repo-slug}/pamet.md"
 
   self_documentation:
     enabled: true
-    log_path: "projects/{slug}/log.md"
+    log_path: "repos/{repo-slug}/log.md"
 
 server:
   host: "0.0.0.0"

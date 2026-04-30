@@ -84,10 +84,17 @@ class ByteProgrammer:
 
         logger.info(f"[Programmer] {issue_key} | repo: {repo_slug} | stack: {stack}")
 
-        # 3. Sestavení branch name a zjištění výchozí branch
-        branch_name = self._make_branch_name(issue_key, ticket_ctx.get("summary", ""))
+        # 3. Sestavení branch name z typu ticketu
+        issue_type = ticket_ctx.get("issue_type", "")
+        branch_name = self._make_branch_name(issue_key, issue_type)
         stack_str = self._format_stack(stack)
-        default_branch = await self._get_default_branch(repo_slug) or "main"
+
+        # Zjisti release větev (výchozí nebo vyber při více možnostech)
+        release_branch = await self._get_release_branch(repo_slug, issue_key)
+        if not release_branch:
+            # Byte se zeptal a čeká — ukončíme cyklus
+            return ProgrammingResult(False, message="Čeká na výběr release větve")
+        default_branch = release_branch
 
         # 4. Zkontroluj jestli PR už existuje pro tento ticket
         existing_pr = await self._find_existing_pr(repo_slug, branch_name)
@@ -196,6 +203,9 @@ class ByteProgrammer:
             f"**{issue_key}** — {ticket_ctx.get('summary', '')[:60]} | "
             f"PR #{pr_id} | stack: {stack_str}"
         )
+
+        # 12. Přičti cenu za tokeny do Jira customfield_10307
+        await self._update_ticket_cost(issue_key, code_result)
 
         logger.info(f"[Programmer] {issue_key} dokončeno — PR #{pr_id}: {pr_url}")
         return ProgrammingResult(True, branch=branch_name, pr_url=pr_url, pr_id=pr_id)
@@ -352,6 +362,8 @@ Pravidla:
         )
 
         raw = response.content[0].text
+        self._last_input_tokens = response.usage.input_tokens
+        self._last_output_tokens = response.usage.output_tokens
         logger.info(
             f"[Programmer] Kód vygenerován | "
             f"tokeny: {response.usage.input_tokens}+{response.usage.output_tokens}"
@@ -426,15 +438,39 @@ Zapracuj výše uvedené PR komentáře. Odpověz POUZE validním JSON:
     # Pomocné metody
     # -------------------------------------------------------------------------
 
-    def _make_branch_name(self, issue_key: str, summary: str) -> str:
-        """Vytvoří název branché: byte/ND-423-pridej-readme-md (bez diakritiky)"""
-        import unicodedata
-        # Odstraň diakritiku: č→c, ř→r, š→s, ž→z atd.
-        normalized = unicodedata.normalize("NFKD", summary)
-        ascii_text = normalized.encode("ascii", "ignore").decode("ascii")
-        pattern = cfg.byte.branch_pattern
-        slug = re.sub(r"[^a-z0-9]+", "-", ascii_text.lower())[:40].strip("-")
-        return pattern.replace("{ticket-id}", issue_key.upper()).replace("{slug}", slug)
+    async def _update_ticket_cost(self, issue_key: str, code_result: Optional[dict]):
+        """Přičte cenu za Claude volání do Jira customfield_10307."""
+        try:
+            model_cfg = cfg.agent("byte").model
+            cost_input = getattr(model_cfg, "cost_input_per_1m", 3.0)
+            cost_output = getattr(model_cfg, "cost_output_per_1m", 15.0)
+
+            # Tokeny jsou v code_result metadata (pokud jsou)
+            # Fallback na 0 pokud nejsou k dispozici
+            input_tokens = getattr(self, "_last_input_tokens", 0)
+            output_tokens = getattr(self, "_last_output_tokens", 0)
+
+            if input_tokens or output_tokens:
+                cost = (input_tokens * cost_input + output_tokens * cost_output) / 1_000_000
+                await self._jira.update_cost(issue_key, cost)
+        except Exception as e:
+            logger.warning(f"[Programmer] Nepodařilo se aktualizovat cenu: {e}")
+
+    def _make_branch_name(self, issue_key: str, issue_type: str) -> str:
+        """
+        Vytvoří název větve podle typu ticketu:
+        - Bug / Chyba / Dílčí úkol → bugfix/{TICKET-ID}
+        - vše ostatní              → feat/{TICKET-ID}
+        """
+        bug_types = cfg.byte.bug_issue_types if hasattr(cfg.byte, "bug_issue_types") else [
+            "Bug", "Chyba", "Subtask", "Sub-task", "Dílčí úkol"
+        ]
+        patterns = cfg.byte.branch_pattern if hasattr(cfg.byte, "branch_pattern") else {}
+        if issue_type in bug_types:
+            pattern = patterns.get("bugfix", "bugfix/{ticket-id}") if isinstance(patterns, dict) else "bugfix/{ticket-id}"
+        else:
+            pattern = patterns.get("feat", "feat/{ticket-id}") if isinstance(patterns, dict) else "feat/{ticket-id}"
+        return pattern.replace("{ticket-id}", issue_key.upper())
 
     def _format_stack(self, stack: dict) -> str:
         parts = []
@@ -445,6 +481,88 @@ Zapracuj výše uvedené PR komentáře. Odpověz POUZE validním JSON:
         if stack.get("php"):
             parts.append(f"PHP {stack['php']}")
         return " | ".join(parts) if parts else "neznámý"
+
+    async def _get_release_branch(self, repo_slug: str, issue_key: str) -> Optional[str]:
+        """
+        Zjistí release větev pro repozitář.
+        - Pokud repo má 1 release větev → použije ji
+        - Pokud má více → zeptá se v Jiře a čeká na odpověď
+        - Pokud nemá žádnou → vrátí None (Byte eskaluje)
+        """
+        multi = {}
+        if hasattr(cfg.byte, "multi_release_repos"):
+            multi = cfg.byte.multi_release_repos or {}
+
+        if repo_slug in multi:
+            branches = multi[repo_slug]
+            if len(branches) == 1:
+                logger.info(f"[Programmer] {repo_slug} — release větev: {branches[0]}")
+                return branches[0]
+            else:
+                # Více větví — zeptej se
+                return await self._ask_release_branch(issue_key, repo_slug, branches)
+        else:
+            # Výchozí — hledej větev 'release'
+            default = cfg.byte.default_release_branch if hasattr(cfg.byte, "default_release_branch") else "release"
+            token = await self._bb._get_token()
+            import httpx
+            url = f"https://api.bitbucket.org/2.0/repositories/{self._bb._workspace}/{repo_slug}/refs/branches/{default}"
+            async with httpx.AsyncClient() as client:
+                resp = await client.get(url, headers={"Authorization": f"Bearer {token}"}, timeout=10)
+                if resp.is_success:
+                    logger.info(f"[Programmer] {repo_slug} — release větev: {default}")
+                    return default
+            logger.warning(f"[Programmer] {repo_slug} — větev '{default}' nenalezena")
+            return None
+
+    async def _ask_release_branch(self, issue_key: str, repo_slug: str, branches: list) -> Optional[str]:
+        """
+        Zeptá se v Jiře na výběr release větve a čeká na odpověď.
+        Odpověď rozpozná z dalšího komentáře (číslo 1, 2, 3 nebo název větve).
+        """
+        options = "
+".join([f"{i+1}) `{b}`" for i, b in enumerate(branches)])
+        await self._jira.add_comment(
+            issue_key,
+            f"Našel jsem více release větví v `{repo_slug}`:\n\n{options}\n\n"
+            f"Ze které mám vytvořit branch? Odpověz číslem nebo názvem větve."
+        )
+
+        # Počkej max 10 minut na odpověď (polling každých 30s)
+        import asyncio
+        byte_email = cfg.agent("byte").jira.email.lower()
+        for _ in range(20):  # 20 × 30s = 10 minut
+            await asyncio.sleep(30)
+            ticket = await self._jira.get_ticket(issue_key)
+            if not ticket:
+                continue
+            comments = ticket.get("fields", {}).get("comment", {}).get("comments", [])
+            # Hledej poslední komentář od člověka (ne Byte)
+            for c in reversed(comments):
+                author_email = (c.get("author") or {}).get("emailAddress", "").lower()
+                if author_email == byte_email:
+                    continue
+                body = self._jira._extract_text_from_adf(c.get("body", {})).strip()
+                # Zkus číslo
+                if body.isdigit():
+                    idx = int(body) - 1
+                    if 0 <= idx < len(branches):
+                        logger.info(f"[Programmer] Vybrána větev: {branches[idx]}")
+                        return branches[idx]
+                # Zkus název větve
+                for b in branches:
+                    if body.lower() == b.lower():
+                        logger.info(f"[Programmer] Vybrána větev: {b}")
+                        return b
+                break
+
+        # Timeout — eskaluj
+        await self._jira.add_comment(
+            issue_key,
+            "⏱️ Čekal jsem 10 minut na výběr release větve ale nedostal jsem odpověď.\n"
+            "Prosím vyber větev a přesuň ticket zpět na **In development**."
+        )
+        return None
 
     async def _find_existing_pr(self, repo_slug: str, branch_name: str) -> Optional[dict]:
         """Najde existující PR pro danou branch."""
