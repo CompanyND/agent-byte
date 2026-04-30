@@ -109,12 +109,7 @@ class ByteProgrammer:
         if existing_pr:
             logger.info(f"[Programmer] PR #{existing_pr['id']} už existuje pro {issue_key} — pokračuji na existující branch")
             # Nepřidáváme "Začínám" komentář, jen pracujeme dál na existující branch
-        else:
-            # Oznámení do Jiry — Byte začíná
-            await self._jira.add_comment(
-                issue_key,
-                f"Začínám.\n\nStack: {stack_str}\nBranch: `{branch_name}`\n\nVrátím se s PR."
-            )
+        # Nezasílám "Začínám" komentář — vývojář dostane výsledek až bude hotovo
 
         # 5. Vytvoř branch (nebo použij existující)
         branch_ok = await self._bb.create_branch(repo_slug, branch_name, default_branch)
@@ -193,18 +188,25 @@ class ByteProgrammer:
         else:
             logger.warning(f"[Programmer] {issue_key} — předchozí assignee nenalezen, ticket zůstává na Byte")
 
-        # 10. Závěrečný komentář do Jiry — s formátováním
+        # 10. Závěrečný komentář do Jiry — stručný
         reviewer_name = (ticket_ctx.get("previous_assignee") or {}).get("display_name", "reviewer")
         pr_number = pr.get("id", "")
-        await self._jira.add_comment_adf(
-            issue_key,
-            pr_url=pr_url,
-            pr_number=pr_number,
-            branch_name=branch_name,
-            default_branch=default_branch,
-            reviewer_name=reviewer_name,
-            summary=code_result.get("summary", ""),
-        )
+        summary = code_result.get("summary", "")
+        skipped = code_result.get("skipped", "")
+
+        comment_lines = [
+            "✅ Hotovo",
+            "",
+            f"[PR #{pr_number}]({pr_url}) → `{branch_name}`",
+            f"Reviewer: {reviewer_name}",
+        ]
+        if summary:
+            comment_lines += ["", summary]
+        if skipped:
+            comment_lines += ["", f"Vynecháno: {skipped}"]
+        comment_lines += ["", "Připomínky? Napiš do PR nebo sem napiš **zapracuj komentáře**."]
+
+        await self._jira.add_comment(issue_key, "\n".join(comment_lines))
 
         # 11. Samo-dokumentace
         await self._bb.append_log(
