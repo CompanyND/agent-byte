@@ -67,7 +67,7 @@ agents:
 byte_config:
   jira_statuses:
     chat_mode: ["To Do", "Backlog", "Open", "In Review"]
-    programming_mode: ["In Progress"]
+    programming_mode: ["In Progress", "Rozpracováno", "In development"]
     done: ["Ready to test", "Done", "Closed"]
 
   triggers:
