@@ -37,17 +37,16 @@ def _verify_forge_secret(body: bytes, signature: str) -> bool:
 def _classify_event(payload: dict) -> tuple[str, dict]:
     """
     Klasifikuje Jira event.
-    Podporuje formát Jira Automation (formát Jira) i klasický webhook formát.
+    Podporuje formát Jira Automation i klasický webhook formát.
     """
-    # DEBUG — loguj celý payload pro diagnostiku
     logger.info(f"[Webhook] Payload keys: {list(payload.keys())}")
     logger.info(f"[Webhook] Payload preview: {str(payload)[:800]}")
 
-    # Jira Automation "formát Jira" posílá data přímo v rootu
-    # Zkus různé struktury kde může být issue key
     issue_key = ""
     new_status = ""
     assignee_email = ""
+    comment_text = ""
+    comment_author = ""
 
     # Varianta A — klasický webhook: payload.issue.key
     issue = payload.get("issue", {})
@@ -57,23 +56,20 @@ def _classify_event(payload: dict) -> tuple[str, dict]:
         new_status = fields.get("status", {}).get("name", "")
         assignee_email = (fields.get("assignee") or {}).get("emailAddress", "")
 
-    # Varianta B — Jira Automation formát: issueKey přímo v rootu
+    # Varianta B — Jira Automation: issueKey v rootu
     if not issue_key:
         issue_key = payload.get("issueKey", payload.get("issue_key", ""))
 
-    # Varianta C — přes transition objekt
+    # Varianta C — transition objekt
     transition = payload.get("transition", {})
     if transition and not new_status:
         new_status = transition.get("to", {}).get("name", "")
 
-    # Varianta D — changelog v rootu
+    # Varianta D — changelog
     changelog = payload.get("changelog", payload.get("log", {}))
-    if isinstance(changelog, dict):
-        items = changelog.get("items", [])
-    else:
-        items = []
+    items = changelog.get("items", []) if isinstance(changelog, dict) else []
 
-    # Varianta E — Jira Automation může poslat stav přímo
+    # Varianta E — stav přímo v rootu
     if not new_status:
         new_status = (
             payload.get("status", {}).get("name", "") or
@@ -81,23 +77,29 @@ def _classify_event(payload: dict) -> tuple[str, dict]:
             payload.get("transition_to", "")
         )
 
-    # Varianta F — assignee přímo v rootu
+    # Varianta F — assignee v rootu
     if not assignee_email:
         assignee = payload.get("assignee", {})
         if isinstance(assignee, dict):
             assignee_email = assignee.get("emailAddress", assignee.get("email", ""))
 
+    # Komentář — vlastní JSON formát z Jira Automation
+    comment_text = payload.get("commentBody", payload.get("comment", ""))
+    if isinstance(comment_text, dict):
+        comment_text = _extract_comment_text(comment_text)
+    comment_author = payload.get("commentAuthor", payload.get("author", ""))
+
     logger.info(f"[Webhook] Parsed — issue: {issue_key} | status: {new_status} | assignee: {assignee_email}")
 
     byte_email = cfg.agent("byte").jira.email.lower()
-    programming_statuses = cfg.byte.jira_statuses.get("programming_mode", ["In Progress", "Rozpracováno"])
+    programming_statuses = cfg.byte.jira_statuses.get("programming_mode", ["In Progress", "Rozpracováno", "In development"])
 
-    # Zkontroluj přechod do In Progress
+    # Přechod do In Progress
     if issue_key and new_status in programming_statuses:
         if not assignee_email or assignee_email.lower() == byte_email:
             return "in_progress", {"issue_key": issue_key, "new_status": new_status}
 
-    # Zkontroluj changelog items
+    # Changelog items
     for item in items:
         if item.get("field") == "status":
             item_status = item.get("toString", "")
@@ -105,21 +107,29 @@ def _classify_event(payload: dict) -> tuple[str, dict]:
                 if not assignee_email or assignee_email.lower() == byte_email:
                     return "in_progress", {"issue_key": issue_key, "new_status": item_status}
 
-    # Komentář
+    # Komentář — vlastní JSON z Jira Automation (@Byte mention)
     event = payload.get("eventType", payload.get("webhookEvent", ""))
     if "commented" in event and issue_key:
-        if not assignee_email or assignee_email.lower() == byte_email:
-            comment = payload.get("comment", {})
-            body_text = _extract_comment_text(comment.get("body", {}))
-            author_email = (comment.get("author") or {}).get("emailAddress", "")
-            if author_email.lower() != byte_email:
-                return "comment_on_byte_ticket", {
-                    "issue_key": issue_key,
-                    "comment_text": body_text,
-                    "author": (comment.get("author") or {}).get("displayName", ""),
-                }
+        # Ignoruj komentáře od Byte samotného
+        if comment_author and comment_author == cfg.agent("byte").jira.email.split("@")[0]:
+            return "ignore", {}
+        return "comment_on_byte_ticket", {
+            "issue_key": issue_key,
+            "comment_text": comment_text,
+            "author": comment_author,
+        }
 
-    logger.info(f"[Webhook] Ignoruji — issue: {issue_key} | status: '{new_status}' | assignee: '{assignee_email}'")
+    # Fallback — pokud máme issue key + komentář z vlastního JSON
+    if issue_key and comment_text and not new_status:
+        byte_account_id = "712020:e325e856-9c5f-49e5-b6c0-498a581af706"
+        if byte_account_id in comment_text or "@byte" in comment_text.lower():
+            return "comment_on_byte_ticket", {
+                "issue_key": issue_key,
+                "comment_text": comment_text,
+                "author": comment_author,
+            }
+
+    logger.info(f"[Webhook] Ignoruji — issue: {issue_key} | status: '{new_status}'")
     return "ignore", {}
 
 
@@ -176,22 +186,36 @@ async def _process_event(event_type: str, event_data: dict):
 
     logger.info(f"[Webhook] {issue_key} | event: {event_type} | akce: {action} | repo: {repo_slug}")
 
-    # Pokud je akce "program" → spusť programmer
+    # Program → spusť Programmer
     if action == "program":
         from core.programmer import ByteProgrammer
         programmer = ByteProgrammer()
         asyncio.create_task(programmer.run(issue_key))
         return
 
-    # Jinak — chat / review / qa přes agent
+    # Chat / review / qa / mention → přes Agent
     stack = {}
     global_memory, project_memory = "", ""
+    pr_diff = ""
 
     if repo_slug:
         stack, (global_memory, project_memory) = await asyncio.gather(
             bb.detect_stack(repo_slug),
             bb.read_memory(repo_slug),
         )
+
+    # Při mention (@Byte) nebo fix — načti PR diff který Byte vytvořil
+    if event_type == "comment_on_byte_ticket" and repo_slug:
+        pr_diff = await bb.get_byte_pr_diff(repo_slug, issue_key)
+        if pr_diff:
+            logger.info(f"[Webhook] PR diff načten pro {issue_key} ({len(pr_diff)} znaků)")
+
+    # Sestav extra kontext
+    extra_context = ""
+    if action == "fix":
+        extra_context = comment_text
+    if pr_diff:
+        extra_context = f"{extra_context}\n\n## Kód který jsem vytvořil (PR diff)\n\n{pr_diff}".strip()
 
     byte = get_byte()
     task = ByteTask(
@@ -207,7 +231,7 @@ async def _process_event(event_type: str, event_data: dict):
         global_memory=global_memory,
         project_memory=project_memory,
         action=action,
-        extra_context=comment_text if action == "fix" else "",
+        extra_context=extra_context,
     )
 
     response = await byte.process(task)
@@ -215,6 +239,7 @@ async def _process_event(event_type: str, event_data: dict):
     if response.action == "jira_comment":
         await jira.add_comment(issue_key, response.content)
 
+    # Samo-dokumentace
     if repo_slug:
         log_entry = (
             f"**{issue_key}** | akce: {action} | stack: {stack} | "
@@ -233,7 +258,7 @@ async def handle_jira_event(request: Request):
     if not _verify_forge_secret(raw_body, signature):
         raise HTTPException(status_code=401, detail="Invalid Forge signature")
 
-    # Ochrana proti prázdnému tělu (Jira Automation komentář trigger)
+    # Ochrana proti prázdnému tělu
     if not raw_body or not raw_body.strip():
         logger.warning("[Webhook] Prázdné tělo requestu — ignoruji")
         return {"status": "ignored", "reason": "empty body"}

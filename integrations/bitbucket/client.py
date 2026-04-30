@@ -473,6 +473,70 @@ class BitbucketClient:
             return False
         return await self.commit_files(memory_repo, "main", {path: content}, message)
 
+    async def find_pr_for_ticket(self, repo_slug: str, issue_key: str) -> Optional[dict]:
+        """Najde otevřený nebo mergnutý PR pro daný ticket (podle branch name)."""
+        token = await self._get_token()
+        # Hledáme branch která začíná feat/ nebo bugfix/ a obsahuje issue key
+        issue_lower = issue_key.lower()
+        for state in ["OPEN", "MERGED"]:
+            url = f"{BB_API}/repositories/{self._workspace}/{repo_slug}/pullrequests"
+            params = {"state": state, "pagelen": 50}
+            async with httpx.AsyncClient() as client:
+                resp = await client.get(url, headers=self._headers(token), params=params, timeout=10)
+                if not resp.is_success:
+                    continue
+                for pr in resp.json().get("values", []):
+                    branch = pr.get("source", {}).get("branch", {}).get("name", "").lower()
+                    if issue_lower in branch:
+                        return pr
+        return None
+
+    async def get_byte_pr_diff(self, repo_slug: str, issue_key: str) -> str:
+        """
+        Načte diff PR který Byte vytvořil pro daný ticket.
+        Filtruje ignorované soubory a vrátí jen relevantní změny.
+        """
+        pr = await self.find_pr_for_ticket(repo_slug, issue_key)
+        if not pr:
+            logger.info(f"[BB] PR pro {issue_key} nenalezen v {repo_slug}")
+            return ""
+
+        pr_id = pr.get("id")
+        pr_url = pr.get("links", {}).get("html", {}).get("href", "")
+        source_branch = pr.get("source", {}).get("branch", {}).get("name", "")
+        dest_branch = pr.get("destination", {}).get("branch", {}).get("name", "")
+
+        logger.info(f"[BB] Načítám diff PR #{pr_id} ({source_branch} → {dest_branch})")
+
+        # Načti diff přes BB API
+        token = await self._get_token()
+        diff_url = f"{BB_API}/repositories/{self._workspace}/{repo_slug}/diff/{source_branch}..{dest_branch}"
+        async with httpx.AsyncClient(follow_redirects=True) as client:
+            resp = await client.get(diff_url, headers=self._headers(token), timeout=30)
+            if not resp.is_success:
+                logger.warning(f"[BB] Diff pro PR #{pr_id} nenačten: {resp.status_code}")
+                return ""
+
+        raw_diff = resp.text
+        filtered_diff, ignored = self.filter_diff(raw_diff)
+        changed_lines = self.count_changed_lines(filtered_diff)
+
+        if ignored:
+            logger.info(f"[BB] Ignorované soubory v diff: {ignored}")
+
+        # Limit — pokud je diff příliš velký, zkrátíme
+        max_chars = 8000
+        if len(filtered_diff) > max_chars:
+            filtered_diff = filtered_diff[:max_chars] + f"
+
+... (diff zkrácen, celkem {changed_lines} změněných řádků)"
+
+        return f"## PR #{pr_id}: {source_branch} → {dest_branch}
+
+```diff
+{filtered_diff}
+```"
+
     async def append_log(self, project_slug: str, entry: str) -> bool:
         """Přidá záznam do samo-dokumentačního logu projektu."""
         if not cfg.byte.self_documentation.get("enabled"):
