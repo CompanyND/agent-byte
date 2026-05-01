@@ -69,6 +69,7 @@ class ByteAgent:
         self._skills: dict[str, Optional[str]] = {
             "review": None,
             "qa": None,
+            "e2e": None,
         }
         self._personas_loaded = False
 
@@ -95,15 +96,17 @@ class ByteAgent:
             bb.get_file(PERSONAS_REPO, "byte/PERSONA.md"),
             bb.get_file(PERSONAS_REPO, "byte/skills/REVIEW.md"),
             bb.get_file(PERSONAS_REPO, "byte/skills/QA.md"),
+            bb.get_file(PERSONAS_REPO, "byte/skills/E2E.md"),
             return_exceptions=True,
         )
 
-        soul, persona, review_skill, qa_skill = results
+        soul, persona, review_skill, qa_skill, e2e_skill = results
 
         self._soul = soul if isinstance(soul, str) else ""
         self._persona = persona if isinstance(persona, str) else ""
         self._skills["review"] = review_skill if isinstance(review_skill, str) else ""
         self._skills["qa"] = qa_skill if isinstance(qa_skill, str) else ""
+        self._skills["e2e"] = e2e_skill if isinstance(e2e_skill, str) else ""
         self._personas_loaded = True
 
         loaded = [
@@ -111,6 +114,7 @@ class ByteAgent:
             f"PERSONA({'ok' if self._persona else 'CHYBÍ'})",
             f"REVIEW({'ok' if self._skills['review'] else 'CHYBÍ'})",
             f"QA({'ok' if self._skills['qa'] else 'CHYBÍ'})",
+            f"E2E({'ok' if self._skills['e2e'] else 'CHYBÍ'})",
         ]
         logger.info(f"[Byte] Personas načteny: {', '.join(loaded)}")
 
@@ -150,6 +154,7 @@ class ByteAgent:
         return {
             "review": "review",
             "qa": "qa",
+            "e2e_test": "e2e",
             "fix": "review",
             "program": None,
             "chat": None,
