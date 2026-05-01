@@ -92,18 +92,17 @@ class ByteProgrammer:
         branch_name = self._make_branch_name(issue_key, issue_type)
         stack_str = self._format_stack(stack)
 
-        # Zjisti release větev — z ní se vytvoří branch
+        # Zjisti release větev (výchozí nebo vyber při více možnostech)
         release_branch = await self._get_release_branch(repo_slug, issue_key)
         if not release_branch:
+            # Byte se zeptal a čeká — ukončíme cyklus
             await self._report_error(
                 issue_key,
                 "Nepodařilo se určit release větev pro repozitář `" + repo_slug + "`.",
                 "Buď větev 'release' neexistuje, nebo vypršel timeout čekání na odpověď."
             )
             return ProgrammingResult(False, message="Čeká na výběr release větve")
-
-        # Hlavní branch repozitáře — PR míří sem (master nebo main)
-        main_branch = await self._get_default_branch(repo_slug) or "master"
+        default_branch = release_branch
 
         # 4. Zkontroluj jestli PR už existuje pro tento ticket
         existing_pr = await self._find_existing_pr(repo_slug, branch_name)
@@ -117,8 +116,8 @@ class ByteProgrammer:
                 f"Začínám.\n\nStack: {stack_str}\nBranch: `{branch_name}`\n\nVrátím se s PR."
             )
 
-        # 5. Vytvoř branch Z release větve (nebo použij existující)
-        branch_ok = await self._bb.create_branch(repo_slug, branch_name, release_branch)
+        # 5. Vytvoř branch (nebo použij existující)
+        branch_ok = await self._bb.create_branch(repo_slug, branch_name, default_branch)
         if not branch_ok:
             await self._report_error(
                 issue_key,
@@ -166,7 +165,7 @@ class ByteProgrammer:
             repo_slug=repo_slug,
             title=f"[BYTE] {issue_key} — {ticket_ctx.get('summary', '')[:60]}",
             source_branch=branch_name,
-            destination_branch=main_branch,
+            destination_branch=default_branch,
             description=self._build_pr_description(
                 ticket_ctx, stack, code_result, branch_name
             ),
@@ -194,27 +193,29 @@ class ByteProgrammer:
         else:
             logger.warning(f"[Programmer] {issue_key} — předchozí assignee nenalezen, ticket zůstává na Byte")
 
-        # 10. Závěrečný komentář do Jiry — stručný
+        # 10. Závěrečný komentář do Jiry — s formátováním
         reviewer_name = (ticket_ctx.get("previous_assignee") or {}).get("display_name", "reviewer")
         pr_number = pr.get("id", "")
-        summary = code_result.get("summary", "")
-        skipped = code_result.get("skipped", "")
+        await self._jira.add_comment_adf(
+            issue_key,
+            pr_url=pr_url,
+            pr_number=pr_number,
+            branch_name=branch_name,
+            default_branch=default_branch,
+            reviewer_name=reviewer_name,
+            summary=code_result.get("summary", ""),
+        )
 
-        comment_lines = [
-            "✅ Hotovo",
-            "",
-            f"[PR #{pr_number}]({pr_url}) → `{main_branch}`",
-            f"Reviewer: {reviewer_name}",
-        ]
-        if summary:
-            comment_lines += ["", summary]
-        if skipped:
-            comment_lines += ["", f"Vynecháno: {skipped}"]
-        comment_lines += ["", "Připomínky? Napiš do PR nebo sem napiš **zapracuj komentáře**."]
+        # 11. Aktualizuj repozitářovou paměť — Byte zapíše co zjistil o projektu
+        asyncio.create_task(self._update_repo_memory(
+            repo_slug=repo_slug,
+            issue_key=issue_key,
+            stack=stack,
+            code_result=code_result,
+            ticket_ctx=ticket_ctx,
+        ))
 
-        await self._jira.add_comment(issue_key, "\n".join(comment_lines))
-
-        # 11. Samo-dokumentace
+        # 12. Samo-dokumentace
         await self._bb.append_log(
             repo_slug,
             f"**{issue_key}** — {ticket_ctx.get('summary', '')[:60]} | "
@@ -226,6 +227,86 @@ class ByteProgrammer:
 
         logger.info(f"[Programmer] {issue_key} dokončeno — PR #{pr_id}: {pr_url}")
         return ProgrammingResult(True, branch=branch_name, pr_url=pr_url, pr_id=pr_id)
+
+    async def _update_repo_memory(
+        self,
+        repo_slug: str,
+        issue_key: str,
+        stack: dict,
+        code_result: Optional[dict],
+        ticket_ctx: dict,
+    ):
+        """
+        Byte analyzuje co zjistil o projektu a zapíše poznatky
+        do repozitářové paměti (byte-memory/repos/{repo-slug}/pamet.md).
+        
+        Volá se na pozadí po každém úspěšném PR — neblokuje hlavní cyklus.
+        """
+        if not repo_slug or not code_result:
+            return
+
+        try:
+            # Načti aktuální repozitářovou paměť
+            memory_cfg = cfg.byte.memory
+            memory_repo = memory_cfg.get("global_repo", "byte-memory")
+            repo_path = memory_cfg.get("repo_path", "repos/{repo-slug}/pamet.md").replace(
+                "{repo-slug}", repo_slug
+            )
+            existing_memory = await self._bb.get_file(memory_repo, repo_path) or ""
+
+            # Sestav prompt pro analýzu projektu
+            stack_str = self._format_stack(stack)
+            files_changed = list((code_result.get("files") or {}).keys())
+            summary = code_result.get("summary", "")
+
+            analysis_prompt = f"""Právě jsi dokončil práci na repozitáři `{repo_slug}`.
+
+Ticket: {issue_key} — {ticket_ctx.get("summary", "")}
+Stack: {stack_str if stack_str else "neznámý"}
+Soubory které jsi upravil: {", ".join(files_changed[:10]) if files_changed else "neznámé"}
+Co jsi udělal: {summary}
+
+Aktuální paměť repozitáře:
+{existing_memory if existing_memory else "(prázdná — první záznam)"}
+
+Na základě souborů které jsi viděl a upravoval, napiš STRUČNÉ poznatky o architektuře a konvencích tohoto projektu.
+Piš pouze nové informace které nejsou v aktuální paměti.
+Pokud nemáš žádné nové poznatky, odpověz prázdným řetězcem.
+
+Formát odpovědi (markdown):
+## YYYY-MM-DD — {issue_key}
+- [poznatek 1]
+- [poznatek 2]
+
+Maximálně 5 odrážek. Buď konkrétní — ne obecné věci jako "projekt používá Git"."""
+
+            model_cfg = cfg.agent("byte").model
+            response = self._client.messages.create(
+                model=model_cfg.model,
+                max_tokens=512,
+                messages=[{"role": "user", "content": analysis_prompt}],
+            )
+
+            new_observations = response.content[0].text.strip()
+
+            # Pokud Byte nemá nové poznatky, nepíše nic
+            if not new_observations or len(new_observations) < 20:
+                logger.info(f"[Programmer] {repo_slug} — žádné nové poznatky k zapamatování")
+                return
+
+            # Připiš nové poznatky do paměti
+            updated_memory = (existing_memory.rstrip() + "\n\n" + new_observations).strip()
+            await self._bb.commit_files(
+                repo_slug=memory_repo,
+                branch="main",
+                files={repo_path: updated_memory},
+                message=f"memory: {repo_slug} — poznatky z {issue_key}",
+            )
+            logger.info(f"[Programmer] Repozitářová paměť {repo_slug} aktualizována")
+
+        except Exception as e:
+            # Chyba v paměti nesmí zastavit hlavní cyklus
+            logger.warning(f"[Programmer] Nepodařilo se aktualizovat repozitářovou paměť: {e}")
 
     async def _report_error(self, issue_key: str, message: str, context: str = ""):
         """Napíše chybový komentář do Jiry — aby vývojář věděl co se stalo."""
@@ -638,11 +719,10 @@ Zapracuj výše uvedené PR komentáře. Odpověz POUZE validním JSON:
         jira_url = f"{cfg.jira_base_url}/browse/{issue_key}"
         stack_str = self._format_stack(stack)
 
-        default_branch = ticket_ctx.get("main_branch", "master")
         desc = (
             f"## [{issue_key}]({jira_url}) — {ticket_ctx.get('summary', '')}\n\n"
             f"**Stack:** {stack_str}\n"
-            f"**Branch:** `{branch_name}` → `{default_branch}`\n\n"
+            f"**Branch:** `{branch_name}`\n\n"
             f"---\n\n"
             f"### Co jsem udělal\n{code_result.get('summary', '')}\n\n"
         )
