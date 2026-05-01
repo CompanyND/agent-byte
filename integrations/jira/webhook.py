@@ -41,16 +41,31 @@ MEMORY_SAVE_GLOBAL_KEYWORDS = [
 ]
 
 
-def _verify_forge_secret(body: bytes, signature: str) -> bool:
+def _verify_token(request_headers: dict) -> bool:
+    """
+    Ověří webhook token ze dvou možných hlaviček:
+    - X-Webhook-Token: statický token (pro Jira Automation webhooky)
+    - X-Forge-Signature: HMAC podpis (pro Jira Forge eventy)
+    
+    Pokud není nastaven žádný secret v ENV, pustí vše (dev mode).
+    """
     secret = cfg.forge_shared_secret
     if not secret:
+        logger.warning("[Webhook] WEBHOOK_SECRET není nastaven — přijímám bez ověření!")
         return True
-    if not signature:
-        return False
-    if hmac.compare_digest(secret, signature):
+
+    # Varianta A — statický token v hlavičce X-Webhook-Token
+    token = request_headers.get("x-webhook-token", "")
+    if token and hmac.compare_digest(secret, token):
         return True
-    expected = hmac.new(secret.encode(), body, hashlib.sha256).hexdigest()
-    return hmac.compare_digest(f"sha256={expected}", signature)
+
+    # Varianta B — Forge HMAC podpis
+    signature = request_headers.get("x-forge-signature", "")
+    if signature:
+        if hmac.compare_digest(secret, signature):
+            return True
+
+    return False
 
 
 def _classify_event(payload: dict) -> tuple[str, dict]:
@@ -434,9 +449,9 @@ async def _process_event(event_type: str, event_data: dict):
 async def handle_jira_event(request: Request):
     raw_body = await request.body()
 
-    signature = request.headers.get("x-forge-signature", "")
-    if not _verify_forge_secret(raw_body, signature):
-        raise HTTPException(status_code=401, detail="Invalid Forge signature")
+    if not _verify_token(dict(request.headers)):
+        logger.warning(f"[Webhook] Zamítnut neautorizovaný request z {request.client.host}")
+        raise HTTPException(status_code=401, detail="Unauthorized — invalid webhook token")
 
     if not raw_body or not raw_body.strip():
         logger.warning("[Webhook] Prázdné tělo requestu — ignoruji")
