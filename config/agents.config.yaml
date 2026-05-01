@@ -73,6 +73,7 @@ byte_config:
   jira_statuses:
     chat_mode: ["To Do", "Backlog", "Open", "In Review", "Otevřeno"]
     programming_mode: ["In Progress", "Rozpracováno", "In development"]
+    testing_mode: ["In Testing", "IN TESTING", "In testing"]
     done: ["Ready to test", "Done", "Closed"]
 
   # Typy ticketů které jdou jako bugfix větev

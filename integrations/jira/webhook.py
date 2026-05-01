@@ -101,10 +101,17 @@ def _classify_event(payload: dict) -> tuple[str, dict]:
 
     byte_email = cfg.agent("byte").jira.email.lower()
     programming_statuses = cfg.byte.jira_statuses.get("programming_mode", ["In Progress", "Rozpracováno", "In development"])
+    testing_statuses = cfg.byte.jira_statuses.get("testing_mode", ["In Testing", "IN TESTING", "In testing"])
 
+    # Přechod do In Progress
     if issue_key and new_status in programming_statuses:
         if not assignee_email or assignee_email.lower() == byte_email:
             return "in_progress", {"issue_key": issue_key, "new_status": new_status}
+
+    # Přechod do In Testing
+    if issue_key and new_status in testing_statuses:
+        if not assignee_email or assignee_email.lower() == byte_email:
+            return "in_testing", {"issue_key": issue_key, "new_status": new_status}
 
     for item in items:
         if item.get("field") == "status":
@@ -112,6 +119,9 @@ def _classify_event(payload: dict) -> tuple[str, dict]:
             if item_status in programming_statuses:
                 if not assignee_email or assignee_email.lower() == byte_email:
                     return "in_progress", {"issue_key": issue_key, "new_status": item_status}
+            if item_status in testing_statuses:
+                if not assignee_email or assignee_email.lower() == byte_email:
+                    return "in_testing", {"issue_key": issue_key, "new_status": item_status}
 
     event = payload.get("eventType", payload.get("webhookEvent", ""))
     if "commented" in event and issue_key:
@@ -162,6 +172,9 @@ def _resolve_action(event_type: str, comment_text: str = "") -> str:
     """
     if event_type == "in_progress":
         return "program"
+
+    if event_type == "in_testing":
+        return "e2e_test"
 
     if event_type in ("assigned_to_byte", "comment_on_byte_ticket"):
         comment_lower = comment_text.lower()
@@ -321,6 +334,20 @@ async def _process_event(event_type: str, event_data: dict):
         from core.programmer import ByteProgrammer
         programmer = ByteProgrammer()
         asyncio.create_task(programmer.run(issue_key))
+        return
+
+    # In Testing → spusť Tester
+    if event_type == "in_testing":
+        from core.tester import ByteTester
+        tester = ByteTester()
+        asyncio.create_task(tester.run(issue_key))
+        return
+
+    # Vytvoření E2ETests složky po potvrzení
+    if action == "chat" and "vytvoř e2etests" in comment_text.lower():
+        from core.tester import ByteTester
+        tester = ByteTester()
+        asyncio.create_task(tester.setup_e2e_folder(issue_key, comment_text))
         return
 
     # Paměť — výpis
