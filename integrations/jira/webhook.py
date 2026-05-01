@@ -21,6 +21,25 @@ router = APIRouter(prefix="/webhook", tags=["webhook"])
 
 JIRA_ID_PATTERN = re.compile(r"([A-Z]{2,10}-\d+)", re.IGNORECASE)
 
+# Klíčová slova pro práci s pamětí
+MEMORY_SHOW_KEYWORDS = [
+    "co víš o tomto projektu", "co víš o projektu", "co si pamatuješ",
+    "ukaž mi paměť", "ukáže paměť", "what do you know", "zobraz paměť",
+    "co víš o repozitáři", "co víš o repo",
+]
+MEMORY_SAVE_REPO_KEYWORDS = [
+    "zapamatuj si u repozitáře:", "zapamatuj si u repo:", "zapamatuj repo:",
+    "remember repo:", "ulož u repozitáře:",
+]
+MEMORY_SAVE_PROJECT_KEYWORDS = [
+    "zapamatuj si u projektu:", "zapamatuj projekt:", "remember project:",
+    "ulož u projektu:", "paměť projektu:",
+]
+MEMORY_SAVE_GLOBAL_KEYWORDS = [
+    "zapamatuj si globálně:", "zapamatuj globálně:", "remember globally:",
+    "ulož globálně:", "paměť globální:",
+]
+
 
 def _verify_forge_secret(body: bytes, signature: str) -> bool:
     secret = cfg.forge_shared_secret
@@ -35,10 +54,6 @@ def _verify_forge_secret(body: bytes, signature: str) -> bool:
 
 
 def _classify_event(payload: dict) -> tuple[str, dict]:
-    """
-    Klasifikuje Jira event.
-    Podporuje formát Jira Automation i klasický webhook formát.
-    """
     logger.info(f"[Webhook] Payload keys: {list(payload.keys())}")
     logger.info(f"[Webhook] Payload preview: {str(payload)[:800]}")
 
@@ -48,7 +63,6 @@ def _classify_event(payload: dict) -> tuple[str, dict]:
     comment_text = ""
     comment_author = ""
 
-    # Varianta A — klasický webhook: payload.issue.key
     issue = payload.get("issue", {})
     if issue:
         issue_key = issue.get("key", "")
@@ -56,20 +70,16 @@ def _classify_event(payload: dict) -> tuple[str, dict]:
         new_status = fields.get("status", {}).get("name", "")
         assignee_email = (fields.get("assignee") or {}).get("emailAddress", "")
 
-    # Varianta B — Jira Automation: issueKey v rootu
     if not issue_key:
         issue_key = payload.get("issueKey", payload.get("issue_key", ""))
 
-    # Varianta C — transition objekt
     transition = payload.get("transition", {})
     if transition and not new_status:
         new_status = transition.get("to", {}).get("name", "")
 
-    # Varianta D — changelog
     changelog = payload.get("changelog", payload.get("log", {}))
     items = changelog.get("items", []) if isinstance(changelog, dict) else []
 
-    # Varianta E — stav přímo v rootu
     if not new_status:
         new_status = (
             payload.get("status", {}).get("name", "") or
@@ -77,13 +87,11 @@ def _classify_event(payload: dict) -> tuple[str, dict]:
             payload.get("transition_to", "")
         )
 
-    # Varianta F — assignee v rootu
     if not assignee_email:
         assignee = payload.get("assignee", {})
         if isinstance(assignee, dict):
             assignee_email = assignee.get("emailAddress", assignee.get("email", ""))
 
-    # Komentář — vlastní JSON formát z Jira Automation
     comment_text = payload.get("commentBody", payload.get("comment", ""))
     if isinstance(comment_text, dict):
         comment_text = _extract_comment_text(comment_text)
@@ -94,12 +102,10 @@ def _classify_event(payload: dict) -> tuple[str, dict]:
     byte_email = cfg.agent("byte").jira.email.lower()
     programming_statuses = cfg.byte.jira_statuses.get("programming_mode", ["In Progress", "Rozpracováno", "In development"])
 
-    # Přechod do In Progress
     if issue_key and new_status in programming_statuses:
         if not assignee_email or assignee_email.lower() == byte_email:
             return "in_progress", {"issue_key": issue_key, "new_status": new_status}
 
-    # Changelog items
     for item in items:
         if item.get("field") == "status":
             item_status = item.get("toString", "")
@@ -107,10 +113,8 @@ def _classify_event(payload: dict) -> tuple[str, dict]:
                 if not assignee_email or assignee_email.lower() == byte_email:
                     return "in_progress", {"issue_key": issue_key, "new_status": item_status}
 
-    # Komentář — vlastní JSON z Jira Automation (@Byte mention)
     event = payload.get("eventType", payload.get("webhookEvent", ""))
     if "commented" in event and issue_key:
-        # Ignoruj komentáře od Byte samotného
         if comment_author and comment_author == cfg.agent("byte").jira.email.split("@")[0]:
             return "ignore", {}
         return "comment_on_byte_ticket", {
@@ -119,7 +123,6 @@ def _classify_event(payload: dict) -> tuple[str, dict]:
             "author": comment_author,
         }
 
-    # Fallback — pokud máme issue key + komentář z vlastního JSON
     if issue_key and comment_text and not new_status:
         byte_account_id = "712020:e325e856-9c5f-49e5-b6c0-498a581af706"
         if byte_account_id in comment_text or "@byte" in comment_text.lower():
@@ -153,18 +156,145 @@ def _extract_node_text(node: dict) -> str:
 
 
 def _resolve_action(event_type: str, comment_text: str = "") -> str:
+    """
+    Rozhodne jakou akci Byte provede.
+    Nově rozpoznává paměťové příkazy.
+    """
     if event_type == "in_progress":
         return "program"
 
     if event_type in ("assigned_to_byte", "comment_on_byte_ticket"):
         comment_lower = comment_text.lower()
+
+        # Paměť — výpis
+        if any(kw in comment_lower for kw in MEMORY_SHOW_KEYWORDS):
+            return "memory_show"
+
+        # Paměť — zápis do repozitáře
+        if any(kw in comment_lower for kw in MEMORY_SAVE_REPO_KEYWORDS):
+            return "memory_save_repo"
+
+        # Paměť — zápis do projektu
+        if any(kw in comment_lower for kw in MEMORY_SAVE_PROJECT_KEYWORDS):
+            return "memory_save_project"
+
+        # Paměť — zápis globálně
+        if any(kw in comment_lower for kw in MEMORY_SAVE_GLOBAL_KEYWORDS):
+            return "memory_save_global"
+
+        # Standardní klíčová slova
         triggers = cfg.byte.triggers.get("on_comment_keywords", {})
         for action, keywords in triggers.items():
             if any(kw.lower() in comment_lower for kw in keywords):
                 return action
+
         return "chat"
 
     return "chat"
+
+
+def _extract_memory_content(comment_text: str, keywords: list) -> str:
+    """Extrahuje obsah za klíčovým slovem paměti."""
+    comment_lower = comment_text.lower()
+    for kw in keywords:
+        if kw in comment_lower:
+            idx = comment_lower.find(kw)
+            return comment_text[idx + len(kw):].strip()
+    return ""
+
+
+async def _handle_memory_show(issue_key: str, repo_slug: str, bb: BitbucketClient, jira: JiraClient):
+    """Vypíše obsah všech úrovní paměti do Jiry."""
+    memory_cfg = cfg.byte.memory
+    memory_repo = memory_cfg.get("global_repo", "byte-memory")
+
+    # Odvoď BB projekt z repo_slug
+    bb_project = repo_slug.split("_")[0] if "_" in repo_slug else repo_slug.split("-")[0]
+
+    global_path = memory_cfg.get("global_path", "global/pamet.md")
+    project_path = memory_cfg.get("project_path", "projects/{bb-project}/pamet.md").replace("{bb-project}", bb_project)
+    repo_path = memory_cfg.get("repo_path", "repos/{repo-slug}/pamet.md").replace("{repo-slug}", repo_slug)
+
+    global_mem, project_mem, repo_mem = await asyncio.gather(
+        bb.get_file(memory_repo, global_path),
+        bb.get_file(memory_repo, project_path),
+        bb.get_file(memory_repo, repo_path),
+    )
+
+    parts = ["## Co vím o projektu\n"]
+
+    if repo_mem:
+        parts.append(f"### Repozitář `{repo_slug}`\n{repo_mem}")
+    else:
+        parts.append(f"### Repozitář `{repo_slug}`\n_(prázdná — zatím žádné záznamy)_")
+
+    if project_mem:
+        parts.append(f"### Projekt `{bb_project}`\n{project_mem}")
+    else:
+        parts.append(f"### Projekt `{bb_project}`\n_(prázdná)_")
+
+    if global_mem:
+        parts.append(f"### Globální\n{global_mem}")
+    else:
+        parts.append("### Globální\n_(prázdná)_")
+
+    await jira.add_comment(issue_key, "\n\n".join(parts))
+    logger.info(f"[Webhook] {issue_key} — paměť vypsána")
+
+
+async def _handle_memory_save(
+    issue_key: str,
+    repo_slug: str,
+    comment_text: str,
+    level: str,  # "repo", "project", "global"
+    bb: BitbucketClient,
+    jira: JiraClient,
+):
+    """Uloží text do příslušné úrovně paměti."""
+    memory_cfg = cfg.byte.memory
+    memory_repo = memory_cfg.get("global_repo", "byte-memory")
+    bb_project = repo_slug.split("_")[0] if "_" in repo_slug else repo_slug.split("-")[0]
+
+    # Extrahuj obsah a cestu podle úrovně
+    if level == "repo":
+        content = _extract_memory_content(comment_text, MEMORY_SAVE_REPO_KEYWORDS)
+        path = memory_cfg.get("repo_path", "repos/{repo-slug}/pamet.md").replace("{repo-slug}", repo_slug)
+        level_label = f"repozitáře `{repo_slug}`"
+    elif level == "project":
+        content = _extract_memory_content(comment_text, MEMORY_SAVE_PROJECT_KEYWORDS)
+        path = memory_cfg.get("project_path", "projects/{bb-project}/pamet.md").replace("{bb-project}", bb_project)
+        level_label = f"projektu `{bb_project}`"
+    else:  # global
+        content = _extract_memory_content(comment_text, MEMORY_SAVE_GLOBAL_KEYWORDS)
+        path = memory_cfg.get("global_path", "global/pamet.md")
+        level_label = "globální paměti"
+
+    if not content:
+        await jira.add_comment(issue_key, "Nerozumím co si mám zapamatovat. Napiš to za dvojtečku, např.:\n`@Byte zapamatuj si u repozitáře: vždy používej české komentáře`")
+        return
+
+    # Načti aktuální obsah a připiš
+    from datetime import datetime
+    existing = await bb.get_file(memory_repo, path) or ""
+    timestamp = datetime.now().strftime("%Y-%m-%d")
+    new_entry = f"\n- [{timestamp}] {content}"
+    updated = existing.rstrip() + new_entry
+
+    ok = await bb.commit_files(
+        repo_slug=memory_repo,
+        branch="main",
+        files={path: updated},
+        message=f"memory: {level} — přidáno přes {issue_key}",
+    )
+
+    if ok:
+        await jira.add_comment(
+            issue_key,
+            f"✅ Zapamatováno do {level_label}:\n\n_{content}_"
+        )
+        logger.info(f"[Webhook] {issue_key} — paměť [{level}] aktualizována: {content[:60]}")
+    else:
+        await jira.add_comment(issue_key, f"❌ Nepodařilo se zapsat do {level_label}. Zkus to znovu.")
 
 
 async def _process_event(event_type: str, event_data: dict):
@@ -193,18 +323,32 @@ async def _process_event(event_type: str, event_data: dict):
         asyncio.create_task(programmer.run(issue_key))
         return
 
+    # Paměť — výpis
+    if action == "memory_show":
+        await _handle_memory_show(issue_key, repo_slug, bb, jira)
+        return
+
+    # Paměť — zápis
+    if action in ("memory_save_repo", "memory_save_project", "memory_save_global"):
+        level = action.replace("memory_save_", "")
+        await _handle_memory_save(issue_key, repo_slug, comment_text, level, bb, jira)
+        return
+
     # Chat / review / qa / mention → přes Agent
     stack = {}
-    global_memory, project_memory = "", ""
-    pr_diff = ""
+    global_memory, project_memory, repo_memory = "", "", ""
 
     if repo_slug:
-        stack, (global_memory, project_memory) = await asyncio.gather(
+        stack, memories = await asyncio.gather(
             bb.detect_stack(repo_slug),
             bb.read_memory(repo_slug),
         )
+        global_memory = memories[0] if memories else ""
+        project_memory = memories[1] if len(memories) > 1 else ""
+        repo_memory = memories[2] if len(memories) > 2 else ""
 
-    # Při mention (@Byte) nebo fix — načti PR diff který Byte vytvořil
+    # Při mention — načti PR diff
+    pr_diff = ""
     if event_type == "comment_on_byte_ticket" and repo_slug:
         pr_diff = await bb.get_byte_pr_diff(repo_slug, issue_key)
         if pr_diff:
@@ -217,6 +361,16 @@ async def _process_event(event_type: str, event_data: dict):
     if pr_diff:
         extra_context = f"{extra_context}\n\n## Kód který jsem vytvořil (PR diff)\n\n{pr_diff}".strip()
 
+    # Sloučení pamětí pro system prompt
+    combined_memory_parts = []
+    if global_memory:
+        combined_memory_parts.append(f"### Globální paměť\n{global_memory}")
+    if project_memory:
+        combined_memory_parts.append(f"### Projektová paměť\n{project_memory}")
+    if repo_memory:
+        combined_memory_parts.append(f"### Paměť repozitáře\n{repo_memory}")
+    combined_memory = "\n\n".join(combined_memory_parts)
+
     byte = get_byte()
     task = ByteTask(
         ticket_id=issue_key,
@@ -228,8 +382,8 @@ async def _process_event(event_type: str, event_data: dict):
         previous_assignee=ticket_ctx.get("previous_assignee"),
         comments=ticket_ctx.get("comments", []),
         stack=stack,
-        global_memory=global_memory,
-        project_memory=project_memory,
+        global_memory=combined_memory,
+        project_memory="",
         action=action,
         extra_context=extra_context,
     )
@@ -239,7 +393,6 @@ async def _process_event(event_type: str, event_data: dict):
     if response.action == "jira_comment":
         await jira.add_comment(issue_key, response.content)
 
-    # Samo-dokumentace
     if repo_slug:
         log_entry = (
             f"**{issue_key}** | akce: {action} | stack: {stack} | "
@@ -258,7 +411,6 @@ async def handle_jira_event(request: Request):
     if not _verify_forge_secret(raw_body, signature):
         raise HTTPException(status_code=401, detail="Invalid Forge signature")
 
-    # Ochrana proti prázdnému tělu
     if not raw_body or not raw_body.strip():
         logger.warning("[Webhook] Prázdné tělo requestu — ignoruji")
         return {"status": "ignored", "reason": "empty body"}
