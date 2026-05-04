@@ -193,6 +193,100 @@ class AgentBase:
 
         return "\n".join(lines)
 
+    async def _get_repo_context(
+        self,
+        repo_slug: str,
+        ticket_summary: str = "",
+        ticket_description: str = "",
+        stack: dict = None,
+    ) -> tuple[str, str, str]:
+        """
+        Sdílená metoda pro všechny skills — načte kompletní kontext repozitáře:
+        1. Strom repozitáře do hloubky 7
+        2. Relevantní soubory (obsah) dle ticketu
+        3. Posledních 10 commitů
+
+        Vrátí (tree_str, files_context, commits_str)
+        """
+        from integrations.bitbucket.client import BitbucketClient
+        bb = BitbucketClient()
+
+        CONTEXT_LIMIT = 150_000
+        FILE_MAX_CHARS = 10_000
+
+        # 1. Strom repozitáře do hloubky 7
+        try:
+            tree = await bb.get_repo_tree(repo_slug, max_depth=7)
+            tree_str = bb.format_tree(tree)
+        except Exception as e:
+            logger.warning(f"[AgentBase] get_repo_tree selhal: {e}")
+            tree_str = ""
+
+        # 2. Posledních 10 commitů
+        try:
+            commits_str = await bb.get_recent_commits(repo_slug, limit=10)
+        except Exception as e:
+            logger.warning(f"[AgentBase] get_recent_commits selhal: {e}")
+            commits_str = ""
+
+        # 3. Relevantní soubory — jen pokud máme ticket kontext
+        files_context = ""
+        if ticket_summary and tree_str:
+            try:
+                prompt = (
+                    f"Repozitář: {repo_slug}\n"
+                    f"Stack: {self._format_stack(stack or {})}\n"
+                    f"Struktura repozitáře (hloubka 7):\n{tree_str[:8000]}\n\n"
+                    f"Ticket: {ticket_summary}\n"
+                    f"Popis: {ticket_description[:800]}\n\n"
+                    f"Vypiš VŠECHNY soubory relevantní pro implementaci tohoto ticketu.\n"
+                    f"Každou cestu na nový řádek. Pouze cesty, bez komentářů.\n"
+                    f"Zahrň: komponenty, service, module, controller, model, DTO, interface.\n"
+                    f"Čím více kontextu vidíš, tím lepší kód napíšeš."
+                )
+
+                response = self._client.messages.create(
+                    model=self._model_cfg.model,
+                    max_tokens=2048,
+                    messages=[{"role": "user", "content": prompt}],
+                )
+
+                raw_paths = response.content[0].text.strip().split("\n")
+                paths = []
+                for line in raw_paths:
+                    path = line.strip().lstrip("- *0123456789. ").strip()
+                    if path and "." in path and not path.startswith("#"):
+                        paths.append(path)
+
+                logger.info(f"[AgentBase] {repo_slug} — Claude označil {len(paths)} relevantních souborů")
+
+                import asyncio
+                contents = await asyncio.gather(
+                    *[bb.get_file(repo_slug, p) for p in paths],
+                    return_exceptions=True
+                )
+
+                result = {}
+                total_chars = 0
+                for path, file_content in zip(paths, contents):
+                    if not isinstance(file_content, str) or not file_content:
+                        continue
+                    truncated = file_content[:FILE_MAX_CHARS]
+                    if total_chars + len(truncated) > CONTEXT_LIMIT:
+                        break
+                    result[path] = truncated
+                    total_chars += len(truncated)
+
+                if result:
+                    parts = [f"### {p}\n```\n{c}\n```" for p, c in result.items()]
+                    files_context = "\n\n".join(parts)
+                    logger.info(f"[AgentBase] {repo_slug} — načteno {len(result)} souborů ({total_chars:,} znaků)")
+
+            except Exception as e:
+                logger.warning(f"[AgentBase] _get_repo_context soubory selhaly: {e}")
+
+        return tree_str, files_context, commits_str
+
     async def process(self, task: AgentTask) -> AgentResponse:
         """
         Hlavní vstupní bod — zpracuje úkol a vrátí odpověď.
@@ -228,22 +322,6 @@ class AgentBase:
         from core.billing import record_cost
         await record_cost(task.ticket_id, input_tokens, output_tokens, self._agent_slug)
 
-        # Samo-dokumentace — log akce do byte-memory
-        if task.repo_slug:
-            try:
-                from integrations.bitbucket.client import BitbucketClient
-                bb = BitbucketClient()
-                # První věta z odpovědi jako shrnutí
-                first_line = content.strip().split("\n")[0][:150].strip()
-                log_entry = (
-                    f"**[{task.ticket_id}]** — {task.ticket_summary[:80]} | "
-                    f"akce: {task.action} | stack: {self._format_stack(task.stack)}"
-                    + (f"\n  {first_line}" if first_line else "")
-                )
-                await bb.append_log(task.repo_slug, log_entry)
-            except Exception as e:
-                logger.warning(f"[{self._agent_slug.capitalize()}] Log selhal: {e}")
-
         return AgentResponse(
             content=content,
             action="jira_comment",
@@ -256,17 +334,6 @@ class AgentBase:
                 "stack": task.stack,
             },
         )
-
-    def _format_stack(self, stack: dict) -> str:
-        """Formátuje stack dict do čitelného stringu."""
-        parts = []
-        if stack.get("angular"):
-            parts.append(f"Angular {stack['angular']}")
-        if stack.get("dotnet"):
-            parts.append(f".NET {stack['dotnet']}")
-        if stack.get("php"):
-            parts.append(f"PHP {stack['php']}")
-        return " | ".join(parts) if parts else "neznámý"
 
     def reload_personas(self):
         """Vynutí znovu načtení personas — volej po změně SOUL.md nebo PERSONA.md."""

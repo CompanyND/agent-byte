@@ -127,14 +127,14 @@ class ByteProgrammer:
             )
             return ProgrammingResult(False, message="Branch creation failed")
 
-        # 6. Načti relevantní soubory z repozitáře
-        relevant_files = await self._fetch_relevant_files(
+        # 6. Načti kompletní kontext repozitáře (strom 7 úrovní + soubory + commity)
+        tree_str, files_context, commits_str = await self._byte._get_repo_context(
             repo_slug=repo_slug,
             ticket_summary=ticket_ctx.get("summary", ""),
             ticket_description=ticket_ctx.get("description", ""),
             stack=stack,
         )
-        logger.info(f"[Programmer] {issue_key} — načteno {len(relevant_files)} relevantních souborů")
+        logger.info(f"[Programmer] {issue_key} — kontext repozitáře načten")
 
         # 7. Vygeneruj kód
         code_result = await self._generate_code(
@@ -144,7 +144,9 @@ class ByteProgrammer:
             project_memory=project_mem,
             repo_slug=repo_slug,
             branch_name=branch_name,
-            relevant_files=relevant_files,
+            tree_str=tree_str,
+            files_context=files_context,
+            commits_str=commits_str,
         )
 
         if not code_result:
@@ -439,7 +441,9 @@ class ByteProgrammer:
         project_memory: str,
         repo_slug: str,
         branch_name: str,
-        relevant_files: dict = None,
+        tree_str: str = "",
+        files_context: str = "",
+        commits_str: str = "",
     ) -> Optional[dict]:
         """
         Vygeneruje kód pro ticket.
@@ -466,12 +470,13 @@ class ByteProgrammer:
         system_prompt = self._byte._build_system_prompt(task)
         user_message = self._byte._build_user_message(task)
 
-        # Přidej obsah relevantních souborů jako kontext
-        if relevant_files:
-            file_context = "\n\n## Existující kód v projektu (relevantní soubory)\n\n"
-            for path, file_content in list(relevant_files.items()):
-                file_context += f"### {path}\n```\n{file_content}\n```\n\n"
-            user_message += file_context
+        # Přidej kontext repozitáře do promptu
+        if tree_str:
+            user_message += f"\n\n## Struktura repozitáře\n\n```\n{tree_str[:6000]}\n```"
+        if commits_str:
+            user_message += f"\n\n## Nedávná aktivita v repozitáři\n\n{commits_str}"
+        if files_context:
+            user_message += f"\n\n## Existující kód (relevantní soubory)\n\n{files_context}"
 
         # Přidáme instrukci pro strukturovaný výstup
         user_message += """

@@ -88,6 +88,93 @@ class BitbucketClient:
         except Exception:
             return None
 
+    async def get_repo_tree(
+        self,
+        repo_slug: str,
+        max_depth: int = 7,
+        ignore_dirs: set = None,
+    ) -> dict[str, list]:
+        """
+        Rekurzivně načte strukturu repozitáře do hloubky max_depth.
+        Vrátí {path: [soubory]} pro každou složku.
+
+        ignore_dirs — složky které přeskočíme (bin, obj, node_modules atd.)
+        """
+        if ignore_dirs is None:
+            ignore_dirs = {
+                "bin", "obj", ".git", "node_modules", ".vs", ".idea",
+                "packages", "wwwroot", "dist", "coverage", ".nyc_output",
+                "__pycache__", "migrations", "Migrations",
+            }
+
+        tree: dict[str, list] = {}
+
+        async def _recurse(path: str, depth: int):
+            if depth > max_depth:
+                return
+            try:
+                files = await self.list_dir(repo_slug, path)
+            except Exception:
+                return
+
+            tree[path or "/"] = files
+
+            # Paralelně prozkoumej podsložky
+            subdirs = [
+                f["path"] for f in files
+                if f.get("type") == "commit_directory"
+                and f["path"].split("/")[-1] not in ignore_dirs
+            ]
+
+            if subdirs:
+                await asyncio.gather(*[_recurse(d, depth + 1) for d in subdirs])
+
+        await _recurse("", 0)
+        return tree
+
+    def format_tree(self, tree: dict[str, list]) -> str:
+        """Formátuje strom do čitelného stringu pro Claude."""
+        lines = []
+        for path, files in sorted(tree.items()):
+            indent = "  " * path.count("/") if path != "/" else ""
+            folder = path if path != "/" else "(root)"
+            lines.append(f"{indent}{folder}/")
+            for f in files:
+                if f.get("type") != "commit_directory":
+                    name = f["path"].split("/")[-1]
+                    lines.append(f"{indent}  {name}")
+        return "\n".join(lines)
+
+    async def get_recent_commits(self, repo_slug: str, limit: int = 10) -> str:
+        """
+        Načte posledních N commitů z repozitáře.
+        Vrátí formátovaný string pro Claude.
+        """
+        try:
+            token = await self._get_token()
+            url = f"{BB_API}/repositories/{self._workspace}/{repo_slug}/commits"
+            async with httpx.AsyncClient(follow_redirects=True) as client:
+                resp = await client.get(
+                    url,
+                    params={"pagelen": limit},
+                    headers=self._headers(token),
+                    timeout=10,
+                )
+                if not resp.is_success:
+                    return ""
+                commits = resp.json().get("values", [])
+
+            lines = [f"### Posledních {len(commits)} commitů"]
+            for c in commits:
+                date = c.get("date", "")[:10]
+                author = (c.get("author") or {}).get("raw", "neznámý")
+                msg = c.get("message", "").strip().split("\n")[0][:80]
+                lines.append(f"- [{date}] {author}: {msg}")
+            return "\n".join(lines)
+        except Exception as e:
+            logger.warning(f"[BB] get_recent_commits selhal: {e}")
+            return ""
+
     async def list_dir(self, repo_slug: str, path: str = "") -> list[dict]:
         """Vrátí všechny soubory v dané cestě — se stránkováním."""
         token = await self._get_token()

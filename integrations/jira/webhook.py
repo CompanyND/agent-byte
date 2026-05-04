@@ -441,12 +441,24 @@ async def _process_event(event_type: str, event_data: dict):
     # Sestav extra kontext
     extra_context = ""
 
-    # Přiřazen na Byte — proaktivní analýza: načti poslední PR
+    # Přiřazen na Byte — načti kompletní kontext repozitáře
     if event_type == "assigned_to_byte":
         if repo_slug:
-            recent_prs = await _get_recent_prs_context(bb, repo_slug)
-            if recent_prs:
-                extra_context = recent_prs
+            byte_agent = get_byte()
+            tree_str, files_context, commits_str = await byte_agent._get_repo_context(
+                repo_slug=repo_slug,
+                ticket_summary=ticket_ctx.get("summary", ""),
+                ticket_description=ticket_ctx.get("description", ""),
+                stack=stack,
+            )
+            parts = []
+            if tree_str:
+                parts.append(f"## Struktura repozitáře\n```\n{tree_str[:4000]}\n```")
+            if commits_str:
+                parts.append(commits_str)
+            if files_context:
+                parts.append(f"## Existující kód\n{files_context[:20000]}")
+            extra_context = "\n\n".join(parts)
 
     # Při mention — načti PR diff
     pr_diff = ""
