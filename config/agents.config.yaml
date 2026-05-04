@@ -97,7 +97,7 @@ byte_config:
   # feat/{TICKET-ID}   — pro všechny typy kromě Bug/Chyba/Subtask
   # bugfix/{TICKET-ID} — pro Bug, Chyba, Dílčí úkol
   branch_pattern:
-    feat: "feat/{ticket-id}"
+    feat: "feature/{ticket-id}"
     bugfix: "bugfix/{ticket-id}"
 
   # Výchozí release větev pro všechny repozitáře

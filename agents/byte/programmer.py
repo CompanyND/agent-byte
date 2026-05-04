@@ -697,7 +697,7 @@ Zapracuj výše uvedené PR komentáře. Odpověz POUZE validním JSON:
         """
         Vytvoří název větve podle typu ticketu:
         - Bug / Chyba / Dílčí úkol → bugfix/{TICKET-ID}
-        - vše ostatní              → feat/{TICKET-ID}
+        - vše ostatní              → feature/{TICKET-ID}
         """
         bug_types = cfg.byte.bug_issue_types if hasattr(cfg.byte, "bug_issue_types") else [
             "Bug", "Chyba", "Subtask", "Sub-task", "Dílčí úkol"
@@ -706,7 +706,7 @@ Zapracuj výše uvedené PR komentáře. Odpověz POUZE validním JSON:
         if issue_type in bug_types:
             pattern = patterns.get("bugfix", "bugfix/{ticket-id}") if isinstance(patterns, dict) else "bugfix/{ticket-id}"
         else:
-            pattern = patterns.get("feat", "feat/{ticket-id}") if isinstance(patterns, dict) else "feat/{ticket-id}"
+            pattern = patterns.get("feat", "feature/{ticket-id}") if isinstance(patterns, dict) else "feature/{ticket-id}"
         return pattern.replace("{ticket-id}", issue_key.upper())
 
     def _format_stack(self, stack: dict) -> str:
