@@ -226,7 +226,16 @@ class ByteProgrammer:
 
         await self._jira.add_comment(issue_key, "\n".join(comment_lines))
 
-        # 11. Samo-dokumentace
+        # 11. Aktualizuj repozitářovou paměť — na pozadí
+        asyncio.create_task(self._update_repo_memory(
+            repo_slug=repo_slug,
+            issue_key=issue_key,
+            stack=stack,
+            code_result=code_result,
+            ticket_ctx=ticket_ctx,
+        ))
+
+        # 12. Samo-dokumentace
         code_summary = code_result.get("summary", "") if code_result else ""
         code_skipped = code_result.get("skipped", "") if code_result else ""
         log_lines = [
@@ -244,6 +253,88 @@ class ByteProgrammer:
 
         logger.info(f"[Programmer] {issue_key} dokončeno — PR #{pr_id}: {pr_url}")
         return ProgrammingResult(True, branch=branch_name, pr_url=pr_url, pr_id=pr_id)
+
+    async def _update_repo_memory(
+        self,
+        repo_slug: str,
+        issue_key: str,
+        stack: dict,
+        code_result: Optional[dict],
+        ticket_ctx: dict,
+    ):
+        """
+        Po každém úspěšném PR Byte zapíše strukturované poznatky o projektu
+        do byte-memory/repos/{repo-slug}/pamet.md.
+
+        Cíl: aby příště Byte nemusel zjišťovat stejné věci znovu.
+        """
+        if not repo_slug or not code_result:
+            return
+
+        try:
+            from datetime import datetime
+            memory_cfg = cfg.byte.memory
+            memory_repo = memory_cfg.get("global_repo", "byte-memory")
+            repo_path = memory_cfg.get("repo_path", "repos/{repo-slug}/pamet.md").replace(
+                "{repo-slug}", repo_slug
+            )
+            existing_memory = await self._bb.get_file(memory_repo, repo_path) or ""
+
+            stack_str = self._format_stack(stack)
+            files_changed = list((code_result.get("files") or {}).keys())
+            summary = code_result.get("summary", "")
+            today = datetime.now().strftime("%Y-%m-%d")
+
+            prompt = (
+                f"Právě jsi dokončil práci na repozitáři `{repo_slug}`.\n\n"
+                f"Ticket: {issue_key} — {ticket_ctx.get('summary', '')}\n"
+                f"Stack: {stack_str or 'neznámý'}\n"
+                f"Soubory které jsi upravoval: {', '.join(files_changed[:15]) or 'neznámé'}\n"
+                f"Co jsi implementoval: {summary}\n\n"
+                f"Aktuální paměť:\n{existing_memory or '(prázdná)'}\n\n"
+                f"Zapiš POUZE nové poznatky které v paměti ještě nejsou. "
+                f"Pokud nemáš nic nového, odpověz prázdným řetězcem.\n\n"
+                f"Formát — každá sekce jen pokud máš nové info:\n\n"
+                f"## {today} — {issue_key}\n\n"
+                f"**Architektura:**\n"
+                f"- [kde leží controllery, services, moduly — konkrétní cesty]\n"
+                f"- [jak je projekt strukturován — co je kde]\n\n"
+                f"**Stack a konvence:**\n"
+                f"- [verze frameworků, ORM, autentizace]\n"
+                f"- [coding konvence které jsi viděl v kódu]\n\n"
+                f"**Specifika projektu:**\n"
+                f"- [kde jsou texty/překlady, jak funguje konfigurace]\n"
+                f"- [co je read-only, co se generuje automaticky]\n"
+                f"- [důležité třídy/services/helpers které se opakují]\n\n"
+                f"**Zjištěno při práci:**\n"
+                f"- [konkrétní poznatky z tohoto ticketu které budou užitečné příště]\n\n"
+                f"Buď konkrétní — piš cesty k souborům, názvy tříd, vzory. "
+                f"Ne obecnosti jako 'projekt používá Angular' nebo 'kód je dobře strukturovaný'."
+            )
+
+            response = self._client.messages.create(
+                model=cfg.agent("byte").model.model,
+                max_tokens=1024,
+                messages=[{"role": "user", "content": prompt}],
+            )
+
+            observations = response.content[0].text.strip()
+
+            if not observations or len(observations) < 30:
+                logger.info(f"[Programmer] {repo_slug} — žádné nové poznatky")
+                return
+
+            updated = (existing_memory.rstrip() + "\n\n" + observations).strip()
+            await self._bb.commit_files(
+                repo_slug=memory_repo,
+                branch="main",
+                files={repo_path: updated},
+                message=f"memory: {repo_slug} — poznatky z {issue_key}",
+            )
+            logger.info(f"[Programmer] Repozitářová paměť {repo_slug} aktualizována ({len(observations)} znaků)")
+
+        except Exception as e:
+            logger.warning(f"[Programmer] Repozitářová paměť selhala: {e}")
 
     async def _report_error(self, issue_key: str, message: str, context: str = ""):
         """Napíše chybový komentář do Jiry — aby vývojář věděl co se stalo."""
