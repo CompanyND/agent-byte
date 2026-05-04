@@ -96,16 +96,23 @@ def _classify_event(payload: dict) -> tuple[str, dict]:
     items = changelog.get("items", []) if isinstance(changelog, dict) else []
 
     if not new_status:
-        new_status = (
-            payload.get("status", {}).get("name", "") or
-            payload.get("toStatus", "") or
-            payload.get("transition_to", "")
-        )
+        status_val = payload.get("status", "")
+        if isinstance(status_val, dict):
+            new_status = status_val.get("name", "")
+        elif isinstance(status_val, str):
+            new_status = status_val
+        new_status = new_status or payload.get("toStatus", "") or payload.get("transition_to", "")
 
     if not assignee_email:
         assignee = payload.get("assignee", {})
         if isinstance(assignee, dict):
             assignee_email = assignee.get("emailAddress", assignee.get("email", ""))
+        # Pro event jira:issue_assigned posíláme assignee jako account ID string
+        # Porovnáme ho přímo s Byte account ID
+        elif isinstance(assignee, str) and assignee:
+            byte_account_id = "712020:e325e856-9c5f-49e5-b6c0-498a581af706"
+            if assignee == byte_account_id:
+                assignee_email = cfg.agent("byte").jira.email.lower()
 
     comment_text = payload.get("commentBody", payload.get("comment", ""))
     if isinstance(comment_text, dict):
