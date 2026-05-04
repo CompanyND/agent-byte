@@ -541,7 +541,7 @@ class BitbucketClient:
             logger.info(f"[BB] Ignorované soubory v diff: {ignored}")
 
         # Limit — pokud je diff příliš velký, zkrátíme
-        max_chars = 8000
+        max_chars = 80_000
         if len(filtered_diff) > max_chars:
             filtered_diff = filtered_diff[:max_chars] + f"\n\n... (diff zkrácen, celkem {changed_lines} změněných řádků)"
 
@@ -552,9 +552,9 @@ class BitbucketClient:
         if not cfg.byte.self_documentation.get("enabled"):
             return True
         memory_repo = cfg.byte.memory.get("global_repo", "byte-memory")
-        log_path = cfg.byte.self_documentation.get("log_path", "projects/{slug}/log.md").replace(
-            "{slug}", project_slug
-        )
+        log_path = cfg.byte.self_documentation.get("log_path", "repos/{repo-slug}/log.md").replace(
+            "{repo-slug}", project_slug
+        ).replace("{slug}", project_slug)
         existing = await self.get_file(memory_repo, log_path) or ""
         from datetime import datetime
         timestamp = datetime.now().strftime("%Y-%m-%d %H:%M")
