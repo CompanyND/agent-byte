@@ -193,47 +193,58 @@ def _extract_node_text(node: dict) -> str:
 
 
 def _resolve_action(event_type: str, comment_text: str = "") -> str:
+    """Zpětná kompatibilita — vrátí první akci."""
+    actions = _resolve_actions(event_type, comment_text)
+    return actions[0] if actions else "chat"
+
+
+def _resolve_actions(event_type: str, comment_text: str = "") -> list[str]:
     """
-    Rozhodne jakou akci Byte provede.
-    Nově rozpoznává paměťové příkazy.
+    Vrátí SEZNAM všech akcí z komentáře.
+    Jeden komentář může obsahovat více paměťových příkazů najednou.
+
+    Příklad:
+    "@Byte zapamatuj si globálně: pravidlo1
+     @Byte zapamatuj si u repozitáře: pravidlo2"
+    → ["memory_save_global", "memory_save_repo"]
     """
     if event_type == "in_progress":
-        return "program"
+        return ["program"]
 
     if event_type == "in_testing":
-        return "e2e_test"
+        return ["e2e_test"]
 
     if event_type == "assigned_to_byte":
-        return "assigned"
+        return ["assigned"]
 
     if event_type in ("assigned_to_byte", "comment_on_byte_ticket"):
         comment_lower = comment_text.lower()
+        actions = []
 
-        # Paměť — výpis
+        # Paměť — výpis (jen jednou)
         if any(kw in comment_lower for kw in MEMORY_SHOW_KEYWORDS):
-            return "memory_show"
+            return ["memory_show"]
 
-        # Paměť — zápis do repozitáře
-        if any(kw in comment_lower for kw in MEMORY_SAVE_REPO_KEYWORDS):
-            return "memory_save_repo"
-
-        # Paměť — zápis do projektu
-        if any(kw in comment_lower for kw in MEMORY_SAVE_PROJECT_KEYWORDS):
-            return "memory_save_project"
-
-        # Paměť — zápis globálně
+        # Paměť — zápis (může být víc v jednom komentáři)
         if any(kw in comment_lower for kw in MEMORY_SAVE_GLOBAL_KEYWORDS):
-            return "memory_save_global"
+            actions.append("memory_save_global")
+        if any(kw in comment_lower for kw in MEMORY_SAVE_PROJECT_KEYWORDS):
+            actions.append("memory_save_project")
+        if any(kw in comment_lower for kw in MEMORY_SAVE_REPO_KEYWORDS):
+            actions.append("memory_save_repo")
+
+        if actions:
+            return actions
 
         # Standardní klíčová slova
         triggers = cfg.byte.triggers.get("on_comment_keywords", {})
         for action, keywords in triggers.items():
             if any(kw.lower() in comment_lower for kw in keywords):
-                return action
+                return [action]
 
-        return "chat"
+        return ["chat"]
 
-    return "chat"
+    return ["chat"]
 
 
 def _extract_memory_content(comment_text: str, keywords: list) -> str:
@@ -389,9 +400,10 @@ async def _process_event(event_type: str, event_data: dict):
 
     repo_slug = ticket_ctx.get("repo_slug", "")
     comment_text = event_data.get("comment_text", "")
-    action = _resolve_action(event_type, comment_text)
+    actions = _resolve_actions(event_type, comment_text)
+    action = actions[0]
 
-    logger.info(f"[Webhook] {issue_key} | event: {event_type} | akce: {action} | repo: {repo_slug}")
+    logger.info(f"[Webhook] {issue_key} | event: {event_type} | akce: {actions} | repo: {repo_slug}")
 
     # Program → spusť Programmer
     if action == "program":
@@ -419,10 +431,12 @@ async def _process_event(event_type: str, event_data: dict):
         await _handle_memory_show(issue_key, repo_slug, bb, jira)
         return
 
-    # Paměť — zápis
-    if action in ("memory_save_repo", "memory_save_project", "memory_save_global"):
-        level = action.replace("memory_save_", "")
-        await _handle_memory_save(issue_key, repo_slug, comment_text, level, bb, jira)
+    # Paměť — zápis (může být více příkazů v jednom komentáři)
+    memory_actions = [a for a in actions if a.startswith("memory_save_")]
+    if memory_actions:
+        for mem_action in memory_actions:
+            level = mem_action.replace("memory_save_", "")
+            await _handle_memory_save(issue_key, repo_slug, comment_text, level, bb, jira)
         return
 
     # Chat / review / qa / mention → přes Agent
@@ -544,7 +558,7 @@ async def handle_jira_event(request: Request):
 
 
 async def _run_programmer(issue_key: str):
-    from agents.byte.programmer import ByteProgrammer
+    from core.programmer import ByteProgrammer
     programmer = ByteProgrammer()
     result = await programmer.run(issue_key)
     if not result.success:
