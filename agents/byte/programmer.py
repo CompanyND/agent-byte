@@ -103,7 +103,8 @@ class ByteProgrammer:
             return ProgrammingResult(False, message="Čeká na výběr release větve")
 
         # Hlavní branch repozitáře — PR míří sem (master nebo main)
-        main_branch = "master"  # PR vždy míří do master
+        # Zjisti hlavní branch repozitáře (master/main nebo specifická větev)
+        main_branch = await self._get_main_branch(repo_slug, issue_key)
 
         # 4. Zkontroluj jestli PR už existuje pro tento ticket
         existing_pr = await self._find_existing_pr(repo_slug, branch_name)
@@ -818,20 +819,118 @@ Zapracuj výše uvedené PR komentáře. Odpověz POUZE validním JSON:
                 return prs[0] if prs else None
         return None
 
+    async def _get_main_branch(self, repo_slug: str, issue_key: str) -> str:
+        """
+        Zjistí hlavní branch repozitáře kam míří PR.
+        Pokud existuje více kandidátů (master, jakub/master atd.),
+        zeptá se v Jiře. Výsledek uloží do repozitářové paměti.
+        """
+        import httpx
+
+        # 1. Zkontroluj paměť
+        memory_cfg = cfg.byte.memory
+        memory_repo = memory_cfg.get("global_repo", "byte-memory")
+        repo_path = memory_cfg.get("repo_path", "repos/{repo-slug}/pamet.md").replace("{repo-slug}", repo_slug)
+        existing_memory = await self._bb.get_file(memory_repo, repo_path) or ""
+
+        for line in existing_memory.split("\n"):
+            if line.startswith("main_branch:"):
+                branch = line.replace("main_branch:", "").strip()
+                logger.info(f"[Programmer] {repo_slug} — main branch z paměti: {branch}")
+                return branch
+
+        # 2. Načti všechny větve
+        try:
+            token = await self._bb._get_token()
+            url = f"https://api.bitbucket.org/2.0/repositories/{self._bb._workspace}/{repo_slug}/refs/branches"
+            async with httpx.AsyncClient() as client:
+                resp = await client.get(
+                    url, params={"pagelen": 50},
+                    headers={"Authorization": f"Bearer {token}"}, timeout=10,
+                )
+                branches = [b["name"] for b in resp.json().get("values", [])] if resp.is_success else []
+        except Exception:
+            return "master"
+
+        # 3. Najdi kandidáty
+        MAIN_PATTERNS = {"master", "main", "develop", "trunk"}
+        candidates = [
+            b for b in branches
+            if b.lower() in MAIN_PATTERNS
+            or b.lower().endswith("/master")
+            or b.lower().endswith("/main")
+        ]
+
+        if not candidates:
+            return "master"
+
+        if len(candidates) == 1:
+            await self._save_main_branch(repo_slug, candidates[0], memory_repo, repo_path, existing_memory)
+            return candidates[0]
+
+        # 4. Více kandidátů — zeptej se
+        selected = await self._ask_main_branch(issue_key, repo_slug, candidates)
+        if selected:
+            await self._save_main_branch(repo_slug, selected, memory_repo, repo_path, existing_memory)
+            return selected
+
+        return candidates[0]
+
+    async def _ask_main_branch(self, issue_key: str, repo_slug: str, branches: list) -> Optional[str]:
+        """Zeptá se v Jiře na výběr cílové větve pro PR."""
+        options = "\n".join([f"{i+1}) `{b}`" for i, b in enumerate(branches)])
+        await self._jira.add_comment(
+            issue_key,
+            f"Našel jsem více možných cílových větví pro PR v `{repo_slug}`:\n\n{options}\n\n"
+            f"Do které větve má mírit PR? Odpověz číslem nebo názvem.\n\n"
+            f"⏱️ Na odpověď čekám **10 minut**. Pokud nestihneš, přesuň ticket zpět na **In development**."
+        )
+        byte_email = cfg.agent("byte").jira.email.lower()
+        for _ in range(20):
+            await asyncio.sleep(30)
+            ticket = await self._jira.get_ticket(issue_key)
+            if not ticket:
+                continue
+            comments = ticket.get("fields", {}).get("comment", {}).get("comments", [])
+            for c in reversed(comments):
+                if (c.get("author") or {}).get("emailAddress", "").lower() == byte_email:
+                    continue
+                body = self._jira._extract_text_from_adf(c.get("body", {})).strip()
+                if body.isdigit():
+                    idx = int(body) - 1
+                    if 0 <= idx < len(branches):
+                        return branches[idx]
+                for b in branches:
+                    if body.lower() == b.lower():
+                        return b
+                break
+        return None
+
+    async def _save_main_branch(
+        self, repo_slug: str, branch: str,
+        memory_repo: str, repo_path: str, existing_memory: str
+    ):
+        """Uloží main branch do repozitářové paměti."""
+        if "main_branch:" in existing_memory:
+            return
+        updated = (existing_memory.rstrip() + f"\nmain_branch: {branch}").strip()
+        await self._bb.commit_files(
+            repo_slug=memory_repo, branch="main",
+            files={repo_path: updated},
+            message=f"memory: {repo_slug} — main branch je {branch}",
+        )
+        logger.info(f"[Programmer] {repo_slug} — main branch {branch} uložena do paměti")
+
     async def _get_default_branch(self, repo_slug: str) -> Optional[str]:
-        """Zjistí výchozí branch repozitáře."""
+        """Záložní metoda pro zpětnou kompatibilitu."""
+        import httpx
         token = await self._bb._get_token()
         url = f"https://api.bitbucket.org/2.0/repositories/{self._bb._workspace}/{repo_slug}"
-        import httpx
         async with httpx.AsyncClient() as client:
-            resp = await client.get(
-                url,
-                headers={"Authorization": f"Bearer {token}"},
-                timeout=10,
-            )
+            resp = await client.get(url, headers={"Authorization": f"Bearer {token}"}, timeout=10)
             if resp.is_success:
-                return resp.json().get("mainbranch", {}).get("name", "main")
-        return "main"
+                return resp.json().get("mainbranch", {}).get("name", "master")
+        return "master"
 
     def _build_pr_description(
         self,
