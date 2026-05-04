@@ -395,21 +395,21 @@ async def _process_event(event_type: str, event_data: dict):
 
     # Program → spusť Programmer
     if action == "program":
-        from core.programmer import ByteProgrammer
+        from agents.byte.programmer import ByteProgrammer
         programmer = ByteProgrammer()
         asyncio.create_task(programmer.run(issue_key))
         return
 
     # In Testing → spusť Tester
     if event_type == "in_testing":
-        from core.tester import ByteTester
+        from agents.byte.tester import ByteTester
         tester = ByteTester()
         asyncio.create_task(tester.run(issue_key))
         return
 
     # Vytvoření E2ETests složky po potvrzení
     if action == "chat" and "vytvoř e2etests" in comment_text.lower():
-        from core.tester import ByteTester
+        from agents.byte.tester import ByteTester
         tester = ByteTester()
         asyncio.create_task(tester.setup_e2e_folder(issue_key, comment_text))
         return
@@ -532,7 +532,7 @@ async def handle_jira_event(request: Request):
 
 
 async def _run_programmer(issue_key: str):
-    from core.programmer import ByteProgrammer
+    from agents.byte.programmer import ByteProgrammer
     programmer = ByteProgrammer()
     result = await programmer.run(issue_key)
     if not result.success:
