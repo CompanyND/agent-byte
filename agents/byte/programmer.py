@@ -215,11 +215,17 @@ class ByteProgrammer:
         await self._jira.add_comment(issue_key, "\n".join(comment_lines))
 
         # 11. Samo-dokumentace
-        await self._bb.append_log(
-            repo_slug,
-            f"**{issue_key}** — {ticket_ctx.get('summary', '')[:60]} | "
-            f"PR #{pr_id} | stack: {stack_str}"
-        )
+        code_summary = code_result.get("summary", "") if code_result else ""
+        code_skipped = code_result.get("skipped", "") if code_result else ""
+        log_lines = [
+            f"**[{issue_key}]** — {ticket_ctx.get('summary', '')[:80]}",
+            f"akce: program | PR #{pr_id} → `{main_branch}` | stack: {stack_str}",
+        ]
+        if code_summary:
+            log_lines.append(f"co: {code_summary[:200]}")
+        if code_skipped:
+            log_lines.append(f"vynecháno: {code_skipped[:100]}")
+        await self._bb.append_log(repo_slug, " | ".join(log_lines[:2]) + (f"\n  {log_lines[2]}" if len(log_lines) > 2 else ""))
 
         # 12. Přičti cenu za tokeny do Jira customfield_10307
         await self._update_ticket_cost(issue_key, code_result)

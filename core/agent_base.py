@@ -228,6 +228,22 @@ class AgentBase:
         from core.billing import record_cost
         await record_cost(task.ticket_id, input_tokens, output_tokens, self._agent_slug)
 
+        # Samo-dokumentace — log akce do byte-memory
+        if task.repo_slug:
+            try:
+                from integrations.bitbucket.client import BitbucketClient
+                bb = BitbucketClient()
+                # První věta z odpovědi jako shrnutí
+                first_line = content.strip().split("\n")[0][:150].strip()
+                log_entry = (
+                    f"**[{task.ticket_id}]** — {task.ticket_summary[:80]} | "
+                    f"akce: {task.action} | stack: {self._format_stack(task.stack)}"
+                    + (f"\n  {first_line}" if first_line else "")
+                )
+                await bb.append_log(task.repo_slug, log_entry)
+            except Exception as e:
+                logger.warning(f"[{self._agent_slug.capitalize()}] Log selhal: {e}")
+
         return AgentResponse(
             content=content,
             action="jira_comment",
@@ -240,6 +256,17 @@ class AgentBase:
                 "stack": task.stack,
             },
         )
+
+    def _format_stack(self, stack: dict) -> str:
+        """Formátuje stack dict do čitelného stringu."""
+        parts = []
+        if stack.get("angular"):
+            parts.append(f"Angular {stack['angular']}")
+        if stack.get("dotnet"):
+            parts.append(f".NET {stack['dotnet']}")
+        if stack.get("php"):
+            parts.append(f"PHP {stack['php']}")
+        return " | ".join(parts) if parts else "neznámý"
 
     def reload_personas(self):
         """Vynutí znovu načtení personas — volej po změně SOUL.md nebo PERSONA.md."""
