@@ -138,6 +138,11 @@ def _classify_event(payload: dict) -> tuple[str, dict]:
                 if not assignee_email or assignee_email.lower() == byte_email:
                     return "in_testing", {"issue_key": issue_key, "new_status": item_status}
 
+    # Přiřazení na Byte (bez přechodu do In development/In testing) → proaktivní analýza
+    if issue_key and assignee_email and assignee_email.lower() == byte_email:
+        if not new_status or (new_status not in programming_statuses and new_status not in testing_statuses):
+            return "assigned_to_byte", {"issue_key": issue_key, "new_status": new_status}
+
     event = payload.get("eventType", payload.get("webhookEvent", ""))
     if "commented" in event and issue_key:
         if comment_author and comment_author == cfg.agent("byte").jira.email.split("@")[0]:
@@ -190,6 +195,9 @@ def _resolve_action(event_type: str, comment_text: str = "") -> str:
 
     if event_type == "in_testing":
         return "e2e_test"
+
+    if event_type == "assigned_to_byte":
+        return "assigned"
 
     if event_type in ("assigned_to_byte", "comment_on_byte_ticket"):
         comment_lower = comment_text.lower()
@@ -325,6 +333,40 @@ async def _handle_memory_save(
         await jira.add_comment(issue_key, f"❌ Nepodařilo se zapsat do {level_label}. Zkus to znovu.")
 
 
+async def _get_recent_prs_context(bb: "BitbucketClient", repo_slug: str, limit: int = 5) -> str:
+    """
+    Načte posledních N mergnutých PR z repozitáře.
+    Dává Byte kontext co se v projektu nedávno dělo.
+    """
+    import httpx
+    try:
+        token = await bb._get_token()
+        url = f"https://api.bitbucket.org/2.0/repositories/{bb._workspace}/{repo_slug}/pullrequests"
+        async with httpx.AsyncClient() as client:
+            resp = await client.get(
+                url,
+                params={"state": "MERGED", "pagelen": limit, "sort": "-updated_on"},
+                headers={"Authorization": f"Bearer {token}"},
+                timeout=10,
+            )
+            if not resp.is_success:
+                return ""
+            prs = resp.json().get("values", [])
+            if not prs:
+                return ""
+
+            lines = [f"### Posledních {len(prs)} mergnutých PR v `{repo_slug}`"]
+            for pr in prs:
+                title = pr.get("title", "")
+                author = (pr.get("author") or {}).get("display_name", "")
+                updated = pr.get("updated_on", "")[:10]
+                lines.append(f"- [{updated}] {title} (autor: {author})")
+            return "\n".join(lines)
+    except Exception as e:
+        logger.warning(f"[Webhook] Nepodařilo se načíst PR historii {repo_slug}: {e}")
+        return ""
+
+
 async def _process_event(event_type: str, event_data: dict):
     issue_key = event_data.get("issue_key", "")
     if not issue_key:
@@ -389,6 +431,16 @@ async def _process_event(event_type: str, event_data: dict):
         project_memory = memories[1] if len(memories) > 1 else ""
         repo_memory = memories[2] if len(memories) > 2 else ""
 
+    # Sestav extra kontext
+    extra_context = ""
+
+    # Přiřazen na Byte — proaktivní analýza: načti poslední PR
+    if event_type == "assigned_to_byte":
+        if repo_slug:
+            recent_prs = await _get_recent_prs_context(bb, repo_slug)
+            if recent_prs:
+                extra_context = recent_prs
+
     # Při mention — načti PR diff
     pr_diff = ""
     if event_type == "comment_on_byte_ticket" and repo_slug:
@@ -396,8 +448,7 @@ async def _process_event(event_type: str, event_data: dict):
         if pr_diff:
             logger.info(f"[Webhook] PR diff načten pro {issue_key} ({len(pr_diff)} znaků)")
 
-    # Sestav extra kontext
-    extra_context = ""
+    # Fix a PR diff doplní extra_context
     if action == "fix":
         extra_context = comment_text
     if pr_diff:

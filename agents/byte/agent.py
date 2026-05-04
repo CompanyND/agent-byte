@@ -37,6 +37,7 @@ class ByteAgent(AgentBase):
             "fix": "review",
             "program": None,
             "chat": None,
+            "assigned": None,
             "memory_show": None,
             "memory_save_repo": None,
             "memory_save_project": None,
@@ -48,6 +49,16 @@ class ByteAgent(AgentBase):
         base = super()._build_user_message(task)
 
         action_instructions = {
+            "assigned": (
+                "\n**Akce:** Byl jsem přiřazen na tento ticket. Proveď proaktivní analýzu:\n"
+                "1. Přečti zadání a acceptance kritéria\n"
+                "2. Podívej se na stack a paměť projektu — co víš o repozitáři?\n"
+                "3. Pokud máš kontext posledních PR, projdi co se v projektu nedávno dělo\n"
+                "4. Navrhni konkrétní přístup k řešení\n"
+                "5. Vypiš co ti chybí nebo co je nejasné — konkrétní otázky\n"
+                "\nBuď stručný. Žádné romány. Vývojář chce vědět: pochopil jsi co má být hotovo? Co potřebuješ?"
+                "\nNEPROGRAMUJ — jen analyzuj a ptej se."
+            ),
             "chat": (
                 "\n**Akce:** Jsem v CHAT režimu (ticket není In development). "
                 "Přečti zadání, zeptej se na nejasnosti, navrhni přístup. NEPROGRAMUJ."
