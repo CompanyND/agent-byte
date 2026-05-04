@@ -118,76 +118,92 @@ class BitbucketClient:
     async def detect_angular_version(self, repo_slug: str) -> Optional[str]:
         """
         Detekuje verzi Angularu z package.json.
-        Prohledá root i podsložky. Fallback na "6" pokud @angular/core nenajde.
+        Hledá jen v kořeni + složkách první úrovně kde název obsahuje 'web', 'frontend', 'app', 'client'.
+        1 API volání místo N.
         """
-        token = await self._get_token()
-        async with httpx.AsyncClient(follow_redirects=True) as client:
-            try:
-                candidates = ["package.json"]
+        try:
+            root_pkg = await self.get_json_file(repo_slug, "package.json")
+            candidates = [root_pkg] if root_pkg else []
+
+            # Přidej package.json z relevantních podsložek první úrovně
+            if not candidates:
                 root_files = await self.list_dir(repo_slug)
-                for f in root_files:
-                    if f.get("type") == "commit_directory":
-                        candidates.append(f"{f['path']}/package.json")
+                relevant_dirs = [
+                    f["path"] for f in root_files
+                    if f.get("type") == "commit_directory"
+                    and any(kw in f["path"].lower() for kw in ("web", "frontend", "app", "client", "flexmvc"))
+                ]
+                pkg_results = await asyncio.gather(
+                    *[self.get_json_file(repo_slug, f"{d}/package.json") for d in relevant_dirs],
+                    return_exceptions=True
+                )
+                candidates = [p for p in pkg_results if isinstance(p, dict)]
 
-                seen_versions = set()
-                for path in candidates:
-                    url = f"{BB_API}/repositories/{self._workspace}/{repo_slug}/src/HEAD/{path}"
-                    resp = await client.get(url, headers=self._headers(token), timeout=10)
-                    if not resp.is_success:
-                        continue
-                    try:
-                        pkg = resp.json()
-                    except Exception:
-                        continue
-                    deps = {**pkg.get("dependencies", {}), **pkg.get("devDependencies", {})}
-                    version = deps.get("@angular/core", "")
-                    if not version:
-                        continue
-                    match = re.search(r"(\d+)", version)
-                    if match:
-                        seen_versions.add(match.group(1))
+            seen_versions = set()
+            for pkg in candidates:
+                if not pkg:
+                    continue
+                deps = {**pkg.get("dependencies", {}), **pkg.get("devDependencies", {})}
+                version = deps.get("@angular/core", "")
+                if not version:
+                    continue
+                match = re.search(r"(\d+)", version)
+                if match:
+                    seen_versions.add(match.group(1))
 
-                if not seen_versions:
-                    return None  # není Angular projekt
-                return str(max(int(v) for v in seen_versions))
-            except Exception:
+            if not seen_versions:
                 return None
+            return str(max(int(v) for v in seen_versions))
+        except Exception:
+            return None
 
     async def detect_dotnet_version(self, repo_slug: str) -> Optional[str]:
-        """Detekuje verzi .NET z .csproj souborů. Majority vote."""
-        token = await self._get_token()
-        async with httpx.AsyncClient(follow_redirects=True) as client:
-            try:
-                candidates: list[str] = []
-                root_files = await self.list_dir(repo_slug)
-                for f in root_files:
-                    if f["path"].endswith(".csproj"):
-                        candidates.append(f["path"])
-                    elif f.get("type") == "commit_directory":
-                        sub_files = await self.list_dir(repo_slug, f["path"])
-                        for sf in sub_files:
-                            if sf["path"].endswith(".csproj"):
-                                candidates.append(sf["path"])
+        """
+        Detekuje verzi .NET z .csproj souborů.
+        Hledá jen v kořeni a první úrovni složek — 1 list_dir volání.
+        """
+        try:
+            root_files = await self.list_dir(repo_slug)
+            csproj_paths = []
 
-                versions = []
-                for csproj_path in candidates:
-                    url = f"{BB_API}/repositories/{self._workspace}/{repo_slug}/src/HEAD/{csproj_path}"
-                    resp = await client.get(url, headers=self._headers(token), timeout=10)
-                    if not resp.is_success:
-                        continue
-                    match = re.search(
-                        r"<TargetFramework(?:Version)?>(.*?)</TargetFramework(?:Version)?>",
-                        resp.text,
-                    )
-                    if match:
-                        versions.append(match.group(1).strip())
+            # .csproj v kořeni
+            csproj_paths += [f["path"] for f in root_files if f["path"].endswith(".csproj")]
 
-                if not versions:
-                    return None
-                from collections import Counter
-                return Counter(versions).most_common(1)[0][0]
-            except Exception:
+            # .csproj v podsložkách první úrovně — zjisti jen z jejich list_dir
+            subdirs = [f["path"] for f in root_files if f.get("type") == "commit_directory"]
+            sub_results = await asyncio.gather(
+                *[self.list_dir(repo_slug, d) for d in subdirs],
+                return_exceptions=True
+            )
+            for sub in sub_results:
+                if isinstance(sub, list):
+                    csproj_paths += [f["path"] for f in sub if f["path"].endswith(".csproj")]
+
+            if not csproj_paths:
                 return None
+
+            versions = []
+            token = await self._get_token()
+            async with httpx.AsyncClient(follow_redirects=True) as client:
+                results = await asyncio.gather(
+                    *[client.get(
+                        f"{BB_API}/repositories/{self._workspace}/{repo_slug}/src/HEAD/{p}",
+                        headers=self._headers(token), timeout=10
+                    ) for p in csproj_paths[:8]],  # max 8 .csproj
+                    return_exceptions=True
+                )
+                for resp in results:
+                    if not isinstance(resp, Exception) and resp.is_success:
+                        match = re.search(r"<TargetFramework[s]?>(net[\w.]+)</TargetFramework", resp.text)
+                        if match:
+                            versions.append(match.group(1))
+
+            if not versions:
+                return None
+            from collections import Counter
+            return Counter(versions).most_common(1)[0][0]
+        except Exception:
+            return None
 
     async def detect_php_version(self, repo_slug: str) -> Optional[str]:
         """Detekuje PHP verzi a framework z composer.json."""
