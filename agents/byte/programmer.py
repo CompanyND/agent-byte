@@ -1,14 +1,17 @@
 """
-core/programmer.py — Byte programuje.
+agents/byte/programmer.py — Byte programuje.
 
-Když ticket přejde do In Progress:
+Když ticket přejde do In development:
 1. Detekuje stack
-2. Načte paměti
+2. Načte paměti (3 úrovně)
 3. Vygeneruje kód přes Claude
-4. Vytvoří branch + commitne
-5. Vytvoří PR na předchozího assignee
-6. Přepne Jira ticket na Ready to test
-7. Komentář do Jiry s PR linkem
+4. Vytvoří branch Z release větve
+5. Commitne soubory
+6. Vytvoří PR DO master větve
+7. Přepne Jira ticket na Ready to test + přiřadí zpět
+8. Stručný komentář do Jiry
+9. Zapíše repozitářovou paměť (na pozadí)
+10. Zapíše billing (přes core.billing)
 """
 
 from __future__ import annotations
@@ -18,12 +21,13 @@ import json
 import logging
 import asyncio
 import anthropic
-from pathlib import Path
 from dataclasses import dataclass
 from typing import Optional
 
 from core.config import cfg
-from core.agent import get_byte, ByteTask
+from core.billing import record_cost
+from core.agent_base import AgentTask
+from agents.byte.agent import get_byte
 from integrations.jira.client import JiraClient
 from integrations.bitbucket.client import BitbucketClient
 
@@ -51,6 +55,15 @@ class ByteProgrammer:
         self._byte = get_byte()
         self._client = anthropic.Anthropic(api_key=cfg.anthropic_api_key)
 
+        # Sledování tokenů přes celý cyklus — kumulativní
+        self._total_input_tokens = 0
+        self._total_output_tokens = 0
+
+    def _track_usage(self, response) -> None:
+        """Přičte tokeny z Claude response do kumulativního počítadla."""
+        self._total_input_tokens += response.usage.input_tokens
+        self._total_output_tokens += response.usage.output_tokens
+
     # -------------------------------------------------------------------------
     # Hlavní vstupní bod
     # -------------------------------------------------------------------------
@@ -58,9 +71,13 @@ class ByteProgrammer:
     async def run(self, issue_key: str) -> ProgrammingResult:
         """
         Kompletní programovací cyklus pro daný ticket.
-        Volá se když ticket přejde do In Progress s Bytem jako assignee.
+        Volá se když ticket přejde do In development s Bytem jako assignee.
         """
         logger.info(f"[Programmer] Spouštím programovací cyklus pro {issue_key}")
+
+        # Reset tokenů pro tento cyklus
+        self._total_input_tokens = 0
+        self._total_output_tokens = 0
 
         # 1. Načti kontext
         ticket_ctx = await self._jira.get_ticket_context(issue_key)
@@ -84,66 +101,58 @@ class ByteProgrammer:
         global_mem = memories[0] if memories else ""
         project_mem = memories[1] if len(memories) > 1 else ""
         repo_mem = memories[2] if len(memories) > 2 else ""
+        combined_memory = "\n\n".join(filter(None, [global_mem, project_mem, repo_mem]))
 
         logger.info(f"[Programmer] {issue_key} | repo: {repo_slug} | stack: {stack}")
 
-        # 3. Sestavení branch name z typu ticketu
+        # 3. Branch name
         issue_type = ticket_ctx.get("issue_type", "")
         branch_name = self._make_branch_name(issue_key, issue_type)
         stack_str = self._format_stack(stack)
 
-        # Zjisti release větev (výchozí nebo vyber při více možnostech)
+        # 4. Zjisti release větev (Z které se vytváří branch)
         release_branch = await self._get_release_branch(repo_slug, issue_key)
         if not release_branch:
-            # Byte se zeptal a čeká — ukončíme cyklus
             await self._report_error(
                 issue_key,
-                "Nepodařilo se určit release větev pro repozitář `" + repo_slug + "`.",
+                f"Nepodařilo se určit release větev pro repozitář `{repo_slug}`.",
                 "Buď větev 'release' neexistuje, nebo vypršel timeout čekání na odpověď."
             )
-            return ProgrammingResult(False, message="Čeká na výběr release větve")
-        default_branch = release_branch
+            return ProgrammingResult(False, message="Chybí release větev")
 
-        # 4. Zkontroluj jestli PR už existuje pro tento ticket
+        # 5. Hlavní branch (DO které míří PR)
+        main_branch = await self._get_default_branch(repo_slug) or "master"
+
+        # 6. Zkontroluj existující PR
         existing_pr = await self._find_existing_pr(repo_slug, branch_name)
         if existing_pr:
-            logger.info(f"[Programmer] PR #{existing_pr['id']} už existuje pro {issue_key} — pokračuji na existující branch")
-            # Nepřidáváme "Začínám" komentář, jen pracujeme dál na existující branch
-        else:
-            # Oznámení do Jiry — Byte začíná
-            await self._jira.add_comment(
-                issue_key,
-                f"Začínám.\n\nStack: {stack_str}\nBranch: `{branch_name}`\n\nVrátím se s PR."
-            )
+            logger.info(f"[Programmer] PR #{existing_pr['id']} existuje pro {issue_key}")
 
-        # 5. Vytvoř branch (nebo použij existující)
-        branch_ok = await self._bb.create_branch(repo_slug, branch_name, default_branch)
+        # 7. Vytvoř branch Z release
+        branch_ok = await self._bb.create_branch(repo_slug, branch_name, release_branch)
         if not branch_ok:
             await self._report_error(
                 issue_key,
-                f"Nepodařilo se vytvořit branch `{branch_name}` z `{default_branch}`.",
+                f"Nepodařilo se vytvořit branch `{branch_name}` z `{release_branch}`.",
                 f"Zkontroluj přístupy Byte k repozitáři `{repo_slug}`."
             )
             return ProgrammingResult(False, message="Branch creation failed")
 
-        # 6. Vygeneruj kód
+        # 8. Vygeneruj kód
         code_result = await self._generate_code(
             ticket_ctx=ticket_ctx,
             stack=stack,
-            global_memory=global_mem,
-            project_memory=project_mem,
+            global_memory=combined_memory,
+            project_memory="",
             repo_slug=repo_slug,
             branch_name=branch_name,
         )
 
         if not code_result:
-            await self._jira.add_comment(
-                issue_key,
-                "❌ Generování kódu selhalo. Eskaluji na zadavatele."
-            )
+            await self._jira.add_comment(issue_key, "❌ Generování kódu selhalo. Eskaluji na zadavatele.")
             return ProgrammingResult(False, message="Code generation failed")
 
-        # 7. Commitni soubory
+        # 9. Commitni soubory
         commit_ok = await self._bb.commit_files(
             repo_slug=repo_slug,
             branch=branch_name,
@@ -159,54 +168,51 @@ class ByteProgrammer:
             )
             return ProgrammingResult(False, message="Commit failed")
 
-        # 8. Vytvoř PR
+        # 10. Vytvoř PR — DO main_branch
         reviewer_account_id = (ticket_ctx.get("previous_assignee") or {}).get("account_id", "")
         pr = await self._bb.create_pr(
             repo_slug=repo_slug,
             title=f"[BYTE] {issue_key} — {ticket_ctx.get('summary', '')[:60]}",
             source_branch=branch_name,
-            destination_branch=default_branch,
-            description=self._build_pr_description(
-                ticket_ctx, stack, code_result, branch_name
-            ),
+            destination_branch=main_branch,
+            description=self._build_pr_description(ticket_ctx, stack, code_result, branch_name, main_branch),
             reviewer_account_id=reviewer_account_id,
         )
 
         if not pr:
             await self._jira.add_comment(
                 issue_key,
-                "❌ PR se nepodařilo vytvořit. Branch je připravena: "
-                f"`{branch_name}` — vytvoř PR prosím ručně."
+                f"❌ PR se nepodařilo vytvořit. Branch je připravena: `{branch_name}` — vytvoř PR prosím ručně."
             )
             return ProgrammingResult(False, branch=branch_name, message="PR creation failed")
 
         pr_url = pr.get("links", {}).get("html", {}).get("href", "")
         pr_id = pr.get("id")
 
-        # 9. Přepni Jira ticket na Ready to test + přiřaď zpět na předchozího assignee
+        # 11. Přepni Jira + přiřaď zpět
         await self._jira.transition(issue_key, "Ready to test")
         previous_account_id = (ticket_ctx.get("previous_assignee") or {}).get("account_id")
-        previous_name = (ticket_ctx.get("previous_assignee") or {}).get("display_name", "předchozí assignee")
+        previous_name = (ticket_ctx.get("previous_assignee") or {}).get("display_name", "reviewer")
         if previous_account_id:
             await self._jira.assign(issue_key, previous_account_id)
-            logger.info(f"[Programmer] {issue_key} přiřazen zpět na {previous_name}")
-        else:
-            logger.warning(f"[Programmer] {issue_key} — předchozí assignee nenalezen, ticket zůstává na Byte")
 
-        # 10. Závěrečný komentář do Jiry — s formátováním
-        reviewer_name = (ticket_ctx.get("previous_assignee") or {}).get("display_name", "reviewer")
-        pr_number = pr.get("id", "")
-        await self._jira.add_comment_adf(
-            issue_key,
-            pr_url=pr_url,
-            pr_number=pr_number,
-            branch_name=branch_name,
-            default_branch=default_branch,
-            reviewer_name=reviewer_name,
-            summary=code_result.get("summary", ""),
-        )
+        # 12. Stručný komentář do Jiry
+        summary = code_result.get("summary", "")
+        skipped = code_result.get("skipped", "")
+        comment_lines = [
+            "✅ Hotovo",
+            "",
+            f"[PR #{pr_id}]({pr_url}) → `{main_branch}`",
+            f"Reviewer: {previous_name}",
+        ]
+        if summary:
+            comment_lines += ["", summary]
+        if skipped:
+            comment_lines += ["", f"Vynecháno: {skipped}"]
+        comment_lines += ["", "Připomínky? Napiš do PR nebo sem napiš **zapracuj komentáře**."]
+        await self._jira.add_comment(issue_key, "\n".join(comment_lines))
 
-        # 11. Aktualizuj repozitářovou paměť — Byte zapíše co zjistil o projektu
+        # 13. Repozitářová paměť (na pozadí)
         asyncio.create_task(self._update_repo_memory(
             repo_slug=repo_slug,
             issue_key=issue_key,
@@ -215,18 +221,21 @@ class ByteProgrammer:
             ticket_ctx=ticket_ctx,
         ))
 
-        # 12. Samo-dokumentace
+        # 14. Samo-dokumentace
         await self._bb.append_log(
             repo_slug,
-            f"**{issue_key}** — {ticket_ctx.get('summary', '')[:60]} | "
-            f"PR #{pr_id} | stack: {stack_str}"
+            f"**{issue_key}** — {ticket_ctx.get('summary', '')[:60]} | PR #{pr_id} | stack: {stack_str}"
         )
 
-        # 12. Přičti cenu za tokeny do Jira customfield_10307
-        await self._update_ticket_cost(issue_key, code_result)
+        # 15. Billing — všechny tokeny z celého cyklu
+        await record_cost(issue_key, self._total_input_tokens, self._total_output_tokens, "byte")
 
         logger.info(f"[Programmer] {issue_key} dokončeno — PR #{pr_id}: {pr_url}")
         return ProgrammingResult(True, branch=branch_name, pr_url=pr_url, pr_id=pr_id)
+
+    # -------------------------------------------------------------------------
+    # Repozitářová paměť
+    # -------------------------------------------------------------------------
 
     async def _update_repo_memory(
         self,
@@ -237,16 +246,13 @@ class ByteProgrammer:
         ticket_ctx: dict,
     ):
         """
-        Byte analyzuje co zjistil o projektu a zapíše poznatky
-        do repozitářové paměti (byte-memory/repos/{repo-slug}/pamet.md).
-        
-        Volá se na pozadí po každém úspěšném PR — neblokuje hlavní cyklus.
+        Byte analyzuje co zjistil a zapíše poznatky do repozitářové paměti.
+        Běží na pozadí — neblokuje hlavní cyklus.
         """
         if not repo_slug or not code_result:
             return
 
         try:
-            # Načti aktuální repozitářovou paměť
             memory_cfg = cfg.byte.memory
             memory_repo = memory_cfg.get("global_repo", "byte-memory")
             repo_path = memory_cfg.get("repo_path", "repos/{repo-slug}/pamet.md").replace(
@@ -254,117 +260,79 @@ class ByteProgrammer:
             )
             existing_memory = await self._bb.get_file(memory_repo, repo_path) or ""
 
-            # Sestav prompt pro analýzu projektu
             stack_str = self._format_stack(stack)
             files_changed = list((code_result.get("files") or {}).keys())
             summary = code_result.get("summary", "")
 
-            analysis_prompt = f"""Právě jsi dokončil práci na repozitáři `{repo_slug}`.
+            from datetime import datetime
+            today = datetime.now().strftime("%Y-%m-%d")
 
-Ticket: {issue_key} — {ticket_ctx.get("summary", "")}
-Stack: {stack_str if stack_str else "neznámý"}
-Soubory které jsi upravil: {", ".join(files_changed[:10]) if files_changed else "neznámé"}
-Co jsi udělal: {summary}
-
-Aktuální paměť repozitáře:
-{existing_memory if existing_memory else "(prázdná — první záznam)"}
-
-Na základě souborů které jsi viděl a upravoval, napiš STRUČNÉ poznatky o architektuře a konvencích tohoto projektu.
-Piš pouze nové informace které nejsou v aktuální paměti.
-Pokud nemáš žádné nové poznatky, odpověz prázdným řetězcem.
-
-Formát odpovědi (markdown):
-## YYYY-MM-DD — {issue_key}
-- [poznatek 1]
-- [poznatek 2]
-
-Maximálně 5 odrážek. Buď konkrétní — ne obecné věci jako "projekt používá Git"."""
-
-            model_cfg = cfg.agent("byte").model
-            response = self._client.messages.create(
-                model=model_cfg.model,
-                max_tokens=512,
-                messages=[{"role": "user", "content": analysis_prompt}],
+            prompt = (
+                f"Právě jsi dokončil práci na repozitáři `{repo_slug}`.\n\n"
+                f"Ticket: {issue_key} — {ticket_ctx.get('summary', '')}\n"
+                f"Stack: {stack_str or 'neznámý'}\n"
+                f"Soubory: {', '.join(files_changed[:10]) or 'neznámé'}\n"
+                f"Co jsi udělal: {summary}\n\n"
+                f"Aktuální paměť:\n{existing_memory or '(prázdná)'}\n\n"
+                f"Napiš STRUČNÉ nové poznatky o architektuře (max 5 odrážek). "
+                f"Pouze info které v paměti ještě není. Pokud nemáš nic nového, odpověz prázdným řetězcem.\n\n"
+                f"Formát:\n## {today} — {issue_key}\n- [poznatek]"
             )
 
-            new_observations = response.content[0].text.strip()
+            response = self._client.messages.create(
+                model=cfg.agent("byte").model.model,
+                max_tokens=512,
+                messages=[{"role": "user", "content": prompt}],
+            )
+            # Poznatky o paměti se nepočítají do billingu ticketu
+            observations = response.content[0].text.strip()
 
-            # Pokud Byte nemá nové poznatky, nepíše nic
-            if not new_observations or len(new_observations) < 20:
-                logger.info(f"[Programmer] {repo_slug} — žádné nové poznatky k zapamatování")
+            if not observations or len(observations) < 20:
                 return
 
-            # Připiš nové poznatky do paměti
-            updated_memory = (existing_memory.rstrip() + "\n\n" + new_observations).strip()
+            updated = (existing_memory.rstrip() + "\n\n" + observations).strip()
             await self._bb.commit_files(
                 repo_slug=memory_repo,
                 branch="main",
-                files={repo_path: updated_memory},
+                files={repo_path: updated},
                 message=f"memory: {repo_slug} — poznatky z {issue_key}",
             )
             logger.info(f"[Programmer] Repozitářová paměť {repo_slug} aktualizována")
 
         except Exception as e:
-            # Chyba v paměti nesmí zastavit hlavní cyklus
-            logger.warning(f"[Programmer] Nepodařilo se aktualizovat repozitářovou paměť: {e}")
-
-    async def _report_error(self, issue_key: str, message: str, context: str = ""):
-        """Napíše chybový komentář do Jiry — aby vývojář věděl co se stalo."""
-        full_message = f"❌ **Chyba při zpracování ticketu**\n\n{message}"
-        if context:
-            full_message += f"\n\n**Detail:** `{context}`"
-        full_message += "\n\nOprav problém a přesuň ticket zpět na **In development**."
-        try:
-            await self._jira.add_comment(issue_key, full_message)
-        except Exception as e:
-            logger.error(f"[Programmer] Nepodařilo se zapsat chybu do Jiry: {e}")
+            logger.warning(f"[Programmer] Paměť: {e}")
 
     # -------------------------------------------------------------------------
     # Opravný cyklus
     # -------------------------------------------------------------------------
 
     async def fix(self, issue_key: str, pr_id: int, repo_slug: str) -> bool:
-        """
-        Zapracuje PR komentáře.
-        Volá se když zadavatel napíše "zapracuj komentáře" do Jiry.
-        """
+        """Zapracuje PR komentáře."""
         logger.info(f"[Programmer] Opravný cyklus {issue_key} PR #{pr_id}")
 
-        # Načti PR komentáře z BB
         pr_comments = await self._bb.get_pr_comments(repo_slug, pr_id)
         if not pr_comments:
-            await self._jira.add_comment(
-                issue_key,
-                "Nenašel jsem žádné komentáře v PR. Jsou komentáře přidány přímo v PR?"
-            )
+            await self._jira.add_comment(issue_key, "Nenašel jsem komentáře v PR.")
             return False
 
-        # Filtruj jen komentáře od lidí (ne od Byte)
         byte_email = cfg.agent("byte").jira.email
         human_comments = [
             c for c in pr_comments
-            if (c.get("author") or {}).get("type") != "bot"
-            and byte_email.split("@")[0] not in
-               (c.get("author") or {}).get("nickname", "").lower()
+            if byte_email.split("@")[0] not in (c.get("author") or {}).get("nickname", "").lower()
         ]
 
         if not human_comments:
-            await self._jira.add_comment(
-                issue_key,
-                "Všechny komentáře v PR jsou ode mě. Nenašel jsem připomínky k zapracování."
-            )
+            await self._jira.add_comment(issue_key, "Všechny PR komentáře jsou ode mě. Žádné připomínky.")
             return False
 
-        # Sestav kontext PR komentářů
         comments_text = "\n\n".join([
             f"**{(c.get('author') or {}).get('display_name', 'reviewer')}** "
-            f"({(c.get('inline') or {}).get('path', 'obecný komentář')}"
+            f"({(c.get('inline') or {}).get('path', 'obecný')}"
             f"{':' + str((c.get('inline') or {}).get('to', '')) if c.get('inline') else ''}):\n"
             f"{(c.get('content') or {}).get('raw', '')}"
             for c in human_comments
         ])
 
-        # Načti aktuální kontext
         ticket_ctx = await self._jira.get_ticket_context(issue_key)
         stack, memories = await asyncio.gather(
             self._bb.detect_stack(repo_slug),
@@ -372,9 +340,7 @@ Maximálně 5 odrážek. Buď konkrétní — ne obecné věci jako "projekt pou
         )
         global_mem = memories[0] if memories else ""
         project_mem = memories[1] if len(memories) > 1 else ""
-        repo_mem = memories[2] if len(memories) > 2 else ""
 
-        # Vygeneruj opravenou verzi
         fix_result = await self._generate_fix(
             ticket_ctx=ticket_ctx or {},
             pr_comments=comments_text,
@@ -387,10 +353,9 @@ Maximálně 5 odrážek. Buď konkrétní — ne obecné věci jako "projekt pou
             await self._jira.add_comment(issue_key, "❌ Generování oprav selhalo.")
             return False
 
-        # Zjisti branch z PR
-        branch_name = f"byte/{issue_key.lower()}"  # fallback — ideálně načíst z PR
+        issue_type = (ticket_ctx or {}).get("issue_type", "")
+        branch_name = self._make_branch_name(issue_key, issue_type)
 
-        # Commitni opravy
         commit_ok = await self._bb.commit_files(
             repo_slug=repo_slug,
             branch=branch_name,
@@ -401,10 +366,10 @@ Maximálně 5 odrážek. Buď konkrétní — ne obecné věci jako "projekt pou
         if commit_ok:
             await self._jira.add_comment(
                 issue_key,
-                f"✅ Komentáře zapracovány.\n\n"
-                f"{fix_result.get('summary', '')}\n\n"
-                f"PR je aktualizované, zkontroluj prosím."
+                f"✅ Komentáře zapracovány.\n\n{fix_result.get('summary', '')}\n\nPR je aktualizované."
             )
+            await record_cost(issue_key, self._total_input_tokens, self._total_output_tokens, "byte")
+
         return commit_ok
 
     # -------------------------------------------------------------------------
@@ -420,18 +385,11 @@ Maximálně 5 odrážek. Buď konkrétní — ne obecné věci jako "projekt pou
         repo_slug: str,
         branch_name: str,
     ) -> Optional[dict]:
-        """
-        Vygeneruje kód pro ticket.
-        Vrátí {"files": {path: content}, "summary": str} nebo None.
-        """
-        model_cfg = cfg.agent("byte").model
-
-        # Sestavíme ByteTask a použijeme agent pro system prompt
-        task = ByteTask(
+        task = AgentTask(
             ticket_id=ticket_ctx.get("ticket_id", ""),
             ticket_summary=ticket_ctx.get("summary", ""),
             ticket_description=ticket_ctx.get("description", ""),
-            ticket_status="In Progress",
+            ticket_status="In development",
             acceptance_criteria=ticket_ctx.get("acceptance_criteria", ""),
             repo_slug=repo_slug,
             previous_assignee=ticket_ctx.get("previous_assignee"),
@@ -444,44 +402,34 @@ Maximálně 5 odrážek. Buď konkrétní — ne obecné věci jako "projekt pou
 
         system_prompt = self._byte._build_system_prompt(task)
         user_message = self._byte._build_user_message(task)
-
-        # Přidáme instrukci pro strukturovaný výstup
         user_message += """
 
-Vygeneruj implementaci. Odpověz POUZE validním JSON v tomto formátu:
+Vygeneruj implementaci. Odpověz POUZE validním JSON:
 {
   "files": {
-    "cesta/k/souboru.ts": "obsah souboru",
-    "cesta/k/souboru.spec.ts": "obsah testu"
+    "cesta/k/souboru.ts": "obsah souboru"
   },
-  "summary": "Co jsem udělal — 2-3 věty pro PR popis",
-  "skipped": "Co jsem záměrně vynechal a proč (nebo prázdný string)"
+  "summary": "Co jsem udělal — 2-3 věty",
+  "skipped": "Co jsem vynechal a proč (nebo prázdný string)"
 }
 
 Pravidla:
-- Piš kód odpovídající existující architektuře projektu
-- Respektuj verzi stacku (Angular verzi, .NET verzi atd.)
+- Kód odpovídající existující architektuře projektu
+- Respektuj verzi stacku
 - Nevynechávej imports
-- Nepiš placeholder komentáře jako "// TODO implement" — implementuj
-- Pokud něco opravdu nevíš, zahrň otázku do "skipped"
+- Nepiš placeholder komentáře — implementuj
 """
 
         response = self._client.messages.create(
-            model=model_cfg.model,
-            max_tokens=model_cfg.max_tokens,
+            model=cfg.agent("byte").model.model,
+            max_tokens=cfg.agent("byte").model.max_tokens,
             system=system_prompt,
             messages=[{"role": "user", "content": user_message}],
         )
+        self._track_usage(response)
+        logger.info(f"[Programmer] Kód vygenerován | tokeny: {response.usage.input_tokens}+{response.usage.output_tokens}")
 
-        raw = response.content[0].text
-        self._last_input_tokens = response.usage.input_tokens
-        self._last_output_tokens = response.usage.output_tokens
-        logger.info(
-            f"[Programmer] Kód vygenerován | "
-            f"tokeny: {response.usage.input_tokens}+{response.usage.output_tokens}"
-        )
-
-        return self._parse_code_response(raw)
+        return self._parse_json_response(response.content[0].text)
 
     async def _generate_fix(
         self,
@@ -491,14 +439,11 @@ Pravidla:
         global_memory: str,
         project_memory: str,
     ) -> Optional[dict]:
-        """Vygeneruje opravenou verzi kódu na základě PR komentářů."""
-        model_cfg = cfg.agent("byte").model
-
-        task = ByteTask(
+        task = AgentTask(
             ticket_id=ticket_ctx.get("ticket_id", ""),
             ticket_summary=ticket_ctx.get("summary", ""),
             ticket_description=ticket_ctx.get("description", ""),
-            ticket_status="In Progress",
+            ticket_status="In development",
             acceptance_criteria=ticket_ctx.get("acceptance_criteria", ""),
             repo_slug=ticket_ctx.get("repo_slug", ""),
             previous_assignee=ticket_ctx.get("previous_assignee"),
@@ -514,31 +459,26 @@ Pravidla:
         user_message = self._byte._build_user_message(task)
         user_message += """
 
-Zapracuj výše uvedené PR komentáře. Odpověz POUZE validním JSON:
+Zapracuj PR komentáře. Odpověz POUZE validním JSON:
 {
-  "files": {
-    "cesta/k/souboru.ts": "opravený obsah souboru"
-  },
-  "summary": "Co jsem opravil — 2-3 věty",
+  "files": {"cesta/souboru.ts": "opravený obsah"},
+  "summary": "Co jsem opravil",
   "skipped": "Co jsem nezapracoval a proč"
 }
 """
 
         response = self._client.messages.create(
-            model=model_cfg.model,
-            max_tokens=model_cfg.max_tokens,
+            model=cfg.agent("byte").model.model,
+            max_tokens=cfg.agent("byte").model.max_tokens,
             system=system_prompt,
             messages=[{"role": "user", "content": user_message}],
         )
+        self._track_usage(response)
+        return self._parse_json_response(response.content[0].text)
 
-        return self._parse_code_response(response.content[0].text)
-
-    def _parse_code_response(self, raw: str) -> Optional[dict]:
-        """Parsuje JSON odpověď od Claudea."""
+    def _parse_json_response(self, raw: str) -> Optional[dict]:
         try:
-            clean = raw.strip()
-            # Odstraň markdown code bloky pokud jsou
-            clean = re.sub(r"^```json\s*", "", clean)
+            clean = re.sub(r"^```json\s*", "", raw.strip())
             clean = re.sub(r"^```\s*", "", clean)
             clean = re.sub(r"\s*```$", "", clean)
             return json.loads(clean.strip())
@@ -550,38 +490,23 @@ Zapracuj výše uvedené PR komentáře. Odpověz POUZE validním JSON:
     # Pomocné metody
     # -------------------------------------------------------------------------
 
-    async def _update_ticket_cost(self, issue_key: str, code_result: Optional[dict]):
-        """Přičte cenu za Claude volání do Jira customfield_10307."""
+    async def _report_error(self, issue_key: str, message: str, context: str = ""):
+        full = f"❌ **Chyba při zpracování ticketu**\n\n{message}"
+        if context:
+            full += f"\n\n**Detail:** `{context}`"
+        full += "\n\nOprav problém a přesuň ticket zpět na **In development**."
         try:
-            model_cfg = cfg.agent("byte").model
-            cost_input = getattr(model_cfg, "cost_input_per_1m", 3.0)
-            cost_output = getattr(model_cfg, "cost_output_per_1m", 15.0)
-
-            # Tokeny jsou v code_result metadata (pokud jsou)
-            # Fallback na 0 pokud nejsou k dispozici
-            input_tokens = getattr(self, "_last_input_tokens", 0)
-            output_tokens = getattr(self, "_last_output_tokens", 0)
-
-            if input_tokens or output_tokens:
-                cost = (input_tokens * cost_input + output_tokens * cost_output) / 1_000_000
-                await self._jira.update_cost(issue_key, cost)
+            await self._jira.add_comment(issue_key, full)
         except Exception as e:
-            logger.warning(f"[Programmer] Nepodařilo se aktualizovat cenu: {e}")
+            logger.error(f"[Programmer] Nepodařilo se zapsat chybu: {e}")
 
     def _make_branch_name(self, issue_key: str, issue_type: str) -> str:
-        """
-        Vytvoří název větve podle typu ticketu:
-        - Bug / Chyba / Dílčí úkol → bugfix/{TICKET-ID}
-        - vše ostatní              → feat/{TICKET-ID}
-        """
-        bug_types = cfg.byte.bug_issue_types if hasattr(cfg.byte, "bug_issue_types") else [
-            "Bug", "Chyba", "Subtask", "Sub-task", "Dílčí úkol"
-        ]
-        patterns = cfg.byte.branch_pattern if hasattr(cfg.byte, "branch_pattern") else {}
+        bug_types = cfg.byte.bug_issue_types
+        patterns = cfg.byte.branch_pattern
         if issue_type in bug_types:
-            pattern = patterns.get("bugfix", "bugfix/{ticket-id}") if isinstance(patterns, dict) else "bugfix/{ticket-id}"
+            pattern = patterns.get("bugfix", "bugfix/{ticket-id}")
         else:
-            pattern = patterns.get("feat", "feat/{ticket-id}") if isinstance(patterns, dict) else "feat/{ticket-id}"
+            pattern = patterns.get("feat", "feat/{ticket-id}")
         return pattern.replace("{ticket-id}", issue_key.upper())
 
     def _format_stack(self, stack: dict) -> str:
@@ -595,43 +520,25 @@ Zapracuj výše uvedené PR komentáře. Odpověz POUZE validním JSON:
         return " | ".join(parts) if parts else "neznámý"
 
     async def _get_release_branch(self, repo_slug: str, issue_key: str) -> Optional[str]:
-        """
-        Zjistí release větev pro repozitář.
-        - Pokud repo má 1 release větev → použije ji
-        - Pokud má více → zeptá se v Jiře a čeká na odpověď
-        - Pokud nemá žádnou → vrátí None (Byte eskaluje)
-        """
-        multi = {}
-        if hasattr(cfg.byte, "multi_release_repos"):
-            multi = cfg.byte.multi_release_repos or {}
-
+        multi = cfg.byte.multi_release_repos or {}
         if repo_slug in multi:
             branches = multi[repo_slug]
             if len(branches) == 1:
-                logger.info(f"[Programmer] {repo_slug} — release větev: {branches[0]}")
                 return branches[0]
-            else:
-                # Více větví — zeptej se
-                return await self._ask_release_branch(issue_key, repo_slug, branches)
+            return await self._ask_release_branch(issue_key, repo_slug, branches)
         else:
-            # Výchozí — hledej větev 'release'
-            default = cfg.byte.default_release_branch if hasattr(cfg.byte, "default_release_branch") else "release"
-            token = await self._bb._get_token()
+            default = cfg.byte.default_release_branch
             import httpx
+            token = await self._bb._get_token()
             url = f"https://api.bitbucket.org/2.0/repositories/{self._bb._workspace}/{repo_slug}/refs/branches/{default}"
             async with httpx.AsyncClient() as client:
                 resp = await client.get(url, headers={"Authorization": f"Bearer {token}"}, timeout=10)
                 if resp.is_success:
-                    logger.info(f"[Programmer] {repo_slug} — release větev: {default}")
                     return default
             logger.warning(f"[Programmer] {repo_slug} — větev '{default}' nenalezena")
             return None
 
     async def _ask_release_branch(self, issue_key: str, repo_slug: str, branches: list) -> Optional[str]:
-        """
-        Zeptá se v Jiře na výběr release větve a čeká na odpověď.
-        Odpověď rozpozná z dalšího komentáře (číslo 1, 2, 3 nebo název větve).
-        """
         options = "\n".join([f"{i+1}) `{b}`" for i, b in enumerate(branches)])
         await self._jira.add_comment(
             issue_key,
@@ -639,35 +546,26 @@ Zapracuj výše uvedené PR komentáře. Odpověz POUZE validním JSON:
             f"Ze které mám vytvořit branch? Odpověz číslem nebo názvem větve."
         )
 
-        # Počkej max 10 minut na odpověď (polling každých 30s)
-        import asyncio
         byte_email = cfg.agent("byte").jira.email.lower()
-        for _ in range(20):  # 20 × 30s = 10 minut
+        for _ in range(20):
             await asyncio.sleep(30)
             ticket = await self._jira.get_ticket(issue_key)
             if not ticket:
                 continue
             comments = ticket.get("fields", {}).get("comment", {}).get("comments", [])
-            # Hledej poslední komentář od člověka (ne Byte)
             for c in reversed(comments):
-                author_email = (c.get("author") or {}).get("emailAddress", "").lower()
-                if author_email == byte_email:
+                if (c.get("author") or {}).get("emailAddress", "").lower() == byte_email:
                     continue
                 body = self._jira._extract_text_from_adf(c.get("body", {})).strip()
-                # Zkus číslo
                 if body.isdigit():
                     idx = int(body) - 1
                     if 0 <= idx < len(branches):
-                        logger.info(f"[Programmer] Vybrána větev: {branches[idx]}")
                         return branches[idx]
-                # Zkus název větve
                 for b in branches:
                     if body.lower() == b.lower():
-                        logger.info(f"[Programmer] Vybrána větev: {b}")
                         return b
                 break
 
-        # Timeout — eskaluj
         await self._jira.add_comment(
             issue_key,
             "⏱️ Čekal jsem 10 minut na výběr release větve ale nedostal jsem odpověď.\n"
@@ -676,15 +574,13 @@ Zapracuj výše uvedené PR komentáře. Odpověz POUZE validním JSON:
         return None
 
     async def _find_existing_pr(self, repo_slug: str, branch_name: str) -> Optional[dict]:
-        """Najde existující PR pro danou branch."""
+        import httpx
         token = await self._bb._get_token()
         url = f"https://api.bitbucket.org/2.0/repositories/{self._bb._workspace}/{repo_slug}/pullrequests"
-        params = {"state": "OPEN", "q": f'source.branch.name="{branch_name}"'}
-        import httpx
         async with httpx.AsyncClient() as client:
             resp = await client.get(
                 url,
-                params=params,
+                params={"state": "OPEN", "q": f'source.branch.name="{branch_name}"'},
                 headers={"Authorization": f"Bearer {token}"},
                 timeout=10,
             )
@@ -694,19 +590,14 @@ Zapracuj výše uvedené PR komentáře. Odpověz POUZE validním JSON:
         return None
 
     async def _get_default_branch(self, repo_slug: str) -> Optional[str]:
-        """Zjistí výchozí branch repozitáře."""
+        import httpx
         token = await self._bb._get_token()
         url = f"https://api.bitbucket.org/2.0/repositories/{self._bb._workspace}/{repo_slug}"
-        import httpx
         async with httpx.AsyncClient() as client:
-            resp = await client.get(
-                url,
-                headers={"Authorization": f"Bearer {token}"},
-                timeout=10,
-            )
+            resp = await client.get(url, headers={"Authorization": f"Bearer {token}"}, timeout=10)
             if resp.is_success:
-                return resp.json().get("mainbranch", {}).get("name", "main")
-        return "main"
+                return resp.json().get("mainbranch", {}).get("name", "master")
+        return "master"
 
     def _build_pr_description(
         self,
@@ -714,6 +605,7 @@ Zapracuj výše uvedené PR komentáře. Odpověz POUZE validním JSON:
         stack: dict,
         code_result: dict,
         branch_name: str,
+        main_branch: str,
     ) -> str:
         issue_key = ticket_ctx.get("ticket_id", "")
         jira_url = f"{cfg.jira_base_url}/browse/{issue_key}"
@@ -722,14 +614,12 @@ Zapracuj výše uvedené PR komentáře. Odpověz POUZE validním JSON:
         desc = (
             f"## [{issue_key}]({jira_url}) — {ticket_ctx.get('summary', '')}\n\n"
             f"**Stack:** {stack_str}\n"
-            f"**Branch:** `{branch_name}`\n\n"
+            f"**Branch:** `{branch_name}` → `{main_branch}`\n\n"
             f"---\n\n"
             f"### Co jsem udělal\n{code_result.get('summary', '')}\n\n"
         )
-
         if code_result.get("skipped"):
             desc += f"### Co jsem vynechal\n{code_result['skipped']}\n\n"
-
         desc += (
             f"---\n"
             f"*Vygenerováno Byte AI agentem. "

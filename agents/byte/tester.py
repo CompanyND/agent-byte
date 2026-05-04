@@ -23,6 +23,7 @@ from typing import Optional
 from dataclasses import dataclass
 
 from core.config import cfg
+from core.billing import record_cost
 from integrations.jira.client import JiraClient
 from integrations.bitbucket.client import BitbucketClient
 
@@ -186,6 +187,9 @@ class ByteTester:
         if tester_account_id:
             await self._jira.assign(issue_key, tester_account_id)
             logger.info(f"[Tester] {issue_key} přiřazen zpět na {tester_name}")
+
+        # Billing
+        await record_cost(issue_key, response.usage.input_tokens, response.usage.output_tokens, "byte")
 
         logger.info(f"[Tester] {issue_key} dokončeno — testy v {test_file_path}")
         return TesterResult(True, message=f"Testy commitnuty do {test_file_path}")

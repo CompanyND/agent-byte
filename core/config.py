@@ -25,6 +25,8 @@ class ModelConfig:
     model: str
     max_tokens: int
     temperature: float
+    cost_input_per_1m: float = 3.00   # USD za 1M input tokenů
+    cost_output_per_1m: float = 15.00  # USD za 1M output tokenů
 
 
 @dataclass
@@ -61,7 +63,10 @@ class ByteConfig:
     jira_statuses: dict
     triggers: dict
     skip_branches: dict
-    branch_pattern: str
+    branch_pattern: dict          # {"feat": "feat/{ticket-id}", "bugfix": "bugfix/{ticket-id}"}
+    bug_issue_types: list
+    default_release_branch: str
+    multi_release_repos: dict
     ignored_files: list
     limits: dict
     memory: dict
@@ -113,10 +118,10 @@ class Config:
         self.jira_base_url: str = atl.get("jira_base_url", "")
         self.bitbucket_workspace: str = atl.get("bitbucket_workspace", "")
 
-        # Forge secret pro ověření requestů
+        # Webhook secret
         self.forge_shared_secret: str = self._env("FORGE_SHARED_SECRET")
 
-        # Byte Railway URL (Forge ho volá)
+        # Byte Railway URL
         self.byte_railway_url: str = self._env("BYTE_RAILWAY_URL")
 
         # Server
@@ -133,7 +138,15 @@ class Config:
             jira_statuses=bc.get("jira_statuses", {}),
             triggers=bc.get("triggers", {}),
             skip_branches=bc.get("skip_branches", {}),
-            branch_pattern=bc.get("branch_pattern", "byte/{ticket-id}-{slug}"),
+            branch_pattern=bc.get("branch_pattern", {
+                "feat": "feat/{ticket-id}",
+                "bugfix": "bugfix/{ticket-id}",
+            }),
+            bug_issue_types=bc.get("bug_issue_types", [
+                "Bug", "Chyba", "Subtask", "Sub-task", "Dílčí úkol"
+            ]),
+            default_release_branch=bc.get("default_release_branch", "release"),
+            multi_release_repos=bc.get("multi_release_repos", {}),
             ignored_files=bc.get("ignored_files", []),
             limits=bc.get("limits", {}),
             memory=bc.get("memory", {}),
@@ -153,6 +166,8 @@ class Config:
             model=model_raw.get("model", "claude-sonnet-4-6"),
             max_tokens=model_raw.get("max_tokens", 4096),
             temperature=model_raw.get("temperature", 0.2),
+            cost_input_per_1m=float(model_raw.get("cost_input_per_1m", 3.00)),
+            cost_output_per_1m=float(model_raw.get("cost_output_per_1m", 15.00)),
         )
 
         jira = None
