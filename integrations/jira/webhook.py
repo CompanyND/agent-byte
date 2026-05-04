@@ -543,9 +543,46 @@ async def handle_jira_event(request: Request):
 
     try:
         payload = await request.json()
-    except Exception as e:
-        logger.error(f"[Webhook] JSON parse error: {e} | body: {raw_body[:200]}")
-        return {"status": "ignored", "reason": "invalid json"}
+    except Exception:
+        # Fallback — Jira Automation posílá neescapované newlines v JSON
+        try:
+            import json as _json
+            import re as _re
+            body_str = raw_body.decode("utf-8", errors="replace")
+            # Nahraď raw newlines/taby uvnitř JSON string hodnot
+            def fix_json_strings(s):
+                result = []
+                i = 0
+                in_str = False
+                while i < len(s):
+                    c = s[i]
+                    if not in_str:
+                        if c == '"':
+                            in_str = True
+                        result.append(c)
+                    else:
+                        if c == '\\':
+                            result.append(c)
+                            i += 1
+                            if i < len(s):
+                                result.append(s[i])
+                        elif c == '"':
+                            in_str = False
+                            result.append(c)
+                        elif c == '\n':
+                            result.append('\\n')
+                        elif c == '\r':
+                            result.append('\\r')
+                        elif c == '\t':
+                            result.append('\\t')
+                        else:
+                            result.append(c)
+                    i += 1
+                return ''.join(result)
+            payload = _json.loads(fix_json_strings(body_str))
+        except Exception as e2:
+            logger.error(f"[Webhook] JSON parse error: {e2} | body: {raw_body[:200]}")
+            return {"status": "ignored", "reason": "invalid json"}
 
     event_type, event_data = _classify_event(payload)
 
