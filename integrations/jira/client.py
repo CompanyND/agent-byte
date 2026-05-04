@@ -156,14 +156,26 @@ class JiraClient:
         }
 
     def _find_previous_assignee(self, changelog: list) -> Optional[dict]:
+        """
+        Najde člověka který ticket naposledy přiřadil NA Byte.
+        To je ten kdo chce review — vrátíme fromAccount (kdo předával).
+        """
         byte_email = cfg.agent("byte").jira.email
+        byte_account_id = "712020:e325e856-9c5f-49e5-b6c0-498a581af706"
+
         for history in reversed(changelog):
             for item in history.get("items", []):
                 if item.get("field") == "assignee":
+                    to_account = item.get("to", "")
+                    to_string = item.get("toString", "")
                     from_account = item.get("from")
                     from_string = item.get("fromString", "")
-                    if from_account and byte_email.lower() not in from_string.lower():
-                        return {"account_id": from_account, "display_name": from_string}
+
+                    # Přiřazení NA Byte → vrať kdo předával
+                    if (to_account == byte_account_id or
+                            byte_email.lower() in (to_string or "").lower()):
+                        if from_account:
+                            return {"account_id": from_account, "display_name": from_string}
         return None
 
     def _extract_text_from_adf(self, adf: dict) -> str:

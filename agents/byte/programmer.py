@@ -103,7 +103,7 @@ class ByteProgrammer:
             return ProgrammingResult(False, message="Čeká na výběr release větve")
 
         # Hlavní branch repozitáře — PR míří sem (master nebo main)
-        main_branch = await self._get_default_branch(repo_slug) or "master"
+        main_branch = "master"  # PR vždy míří do master
 
         # 4. Zkontroluj jestli PR už existuje pro tento ticket
         existing_pr = await self._find_existing_pr(repo_slug, branch_name)
@@ -127,7 +127,16 @@ class ByteProgrammer:
             )
             return ProgrammingResult(False, message="Branch creation failed")
 
-        # 6. Vygeneruj kód
+        # 6. Načti relevantní soubory z repozitáře
+        relevant_files = await self._fetch_relevant_files(
+            repo_slug=repo_slug,
+            ticket_summary=ticket_ctx.get("summary", ""),
+            ticket_description=ticket_ctx.get("description", ""),
+            stack=stack,
+        )
+        logger.info(f"[Programmer] {issue_key} — načteno {len(relevant_files)} relevantních souborů")
+
+        # 7. Vygeneruj kód
         code_result = await self._generate_code(
             ticket_ctx=ticket_ctx,
             stack=stack,
@@ -135,6 +144,7 @@ class ByteProgrammer:
             project_memory=project_mem,
             repo_slug=repo_slug,
             branch_name=branch_name,
+            relevant_files=relevant_files,
         )
 
         if not code_result:
@@ -336,6 +346,91 @@ class ByteProgrammer:
     # Generování kódu přes Claude
     # -------------------------------------------------------------------------
 
+    async def _fetch_relevant_files(
+        self,
+        repo_slug: str,
+        ticket_summary: str,
+        ticket_description: str,
+        stack: dict,
+    ) -> dict[str, str]:
+        """
+        Zeptá se Claudu které soubory jsou relevantní pro daný ticket,
+        pak načte jejich obsah z BB. Vrátí {path: content}.
+        Hlídá celkový limit znaků aby nepřeteklo kontextové okno.
+        """
+        CONTEXT_LIMIT = 150_000
+        FILE_MAX_CHARS = 10_000
+
+        try:
+            root_files = await self._bb.list_dir(repo_slug)
+            structure_lines = []
+            for f in root_files:
+                structure_lines.append(f["path"] + ("/" if f.get("type") == "commit_directory" else ""))
+                if f.get("type") == "commit_directory":
+                    sub = await self._bb.list_dir(repo_slug, f["path"])
+                    for sf in sub:
+                        structure_lines.append(f"  {sf['path']}")
+
+            structure = "\n".join(structure_lines)
+
+            prompt = (
+                f"Repozitář: {repo_slug}\n"
+                f"Stack: {self._format_stack(stack)}\n"
+                f"Struktura repozitáře:\n{structure}\n\n"
+                f"Ticket: {ticket_summary}\n"
+                f"Popis: {ticket_description[:800]}\n\n"
+                f"Vypiš VŠECHNY soubory které jsou relevantní pro implementaci tohoto ticketu.\n"
+                f"Každou cestu na nový řádek. Pouze cesty, bez komentářů, bez číslování.\n"
+                f"Zahrň: komponenty, service, module, controller, model, DTO, interface soubory\n"
+                f"které přímo nebo nepřímo souvisí s tématem ticketu.\n"
+                f"Čím více kontextu Byte uvidí, tím lepší kód napíše."
+            )
+
+            response = self._client.messages.create(
+                model=cfg.agent("byte").model.model,
+                max_tokens=2048,
+                messages=[{"role": "user", "content": prompt}],
+            )
+            self._track_usage(response)
+
+            raw_paths = response.content[0].text.strip().split("\n")
+            paths = []
+            for line in raw_paths:
+                path = line.strip().lstrip("- ").lstrip("* ").lstrip("0123456789. ").strip()
+                if path and not path.startswith("#") and "." in path:
+                    paths.append(path)
+
+            logger.info(f"[Programmer] Claude označil {len(paths)} relevantních souborů")
+
+            contents = await asyncio.gather(
+                *[self._bb.get_file(repo_slug, p) for p in paths],
+                return_exceptions=True
+            )
+
+            result = {}
+            total_chars = 0
+            skipped = []
+
+            for path, file_content in zip(paths, contents):
+                if not isinstance(file_content, str) or not file_content:
+                    continue
+                truncated = file_content[:FILE_MAX_CHARS]
+                if total_chars + len(truncated) > CONTEXT_LIMIT:
+                    skipped.append(path)
+                    continue
+                result[path] = truncated
+                total_chars += len(truncated)
+
+            if skipped:
+                logger.info(f"[Programmer] Vynecháno {len(skipped)} souborů (limit): {', '.join(skipped[:5])}")
+
+            logger.info(f"[Programmer] Načteno {len(result)} souborů ({total_chars:,} / {CONTEXT_LIMIT:,} znaků)")
+            return result
+
+        except Exception as e:
+            logger.warning(f"[Programmer] _fetch_relevant_files selhal: {e}")
+            return {}
+
     async def _generate_code(
         self,
         ticket_ctx: dict,
@@ -344,6 +439,7 @@ class ByteProgrammer:
         project_memory: str,
         repo_slug: str,
         branch_name: str,
+        relevant_files: dict = None,
     ) -> Optional[dict]:
         """
         Vygeneruje kód pro ticket.
@@ -369,6 +465,13 @@ class ByteProgrammer:
 
         system_prompt = self._byte._build_system_prompt(task)
         user_message = self._byte._build_user_message(task)
+
+        # Přidej obsah relevantních souborů jako kontext
+        if relevant_files:
+            file_context = "\n\n## Existující kód v projektu (relevantní soubory)\n\n"
+            for path, file_content in list(relevant_files.items()):
+                file_context += f"### {path}\n```\n{file_content}\n```\n\n"
+            user_message += file_context
 
         # Přidáme instrukci pro strukturovaný výstup
         user_message += """
