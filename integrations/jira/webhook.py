@@ -248,13 +248,30 @@ def _resolve_actions(event_type: str, comment_text: str = "") -> list[str]:
 
 
 def _extract_memory_content(comment_text: str, keywords: list) -> str:
-    """Extrahuje obsah za klíčovým slovem paměti."""
+    """
+    Extrahuje VŠECHNY texty za klíčovými slovy paměti.
+    Jeden komentář může obsahovat více příkazů — každý na novém řádku.
+
+    Příklad:
+    "@Byte zapamatuj si globálně: pravidlo1
+     @Byte zapamatuj si globálně: pravidlo2"
+    → "pravidlo1\npravidlo2"
+    """
+    results = []
     comment_lower = comment_text.lower()
-    for kw in keywords:
-        if kw in comment_lower:
-            idx = comment_lower.find(kw)
-            return comment_text[idx + len(kw):].strip()
-    return ""
+
+    # Projdi každý řádek komentáře
+    for line in comment_text.split("\n"):
+        line_lower = line.lower()
+        for kw in keywords:
+            if kw in line_lower:
+                idx = line_lower.find(kw)
+                extracted = line[idx + len(kw):].strip()
+                if extracted:
+                    results.append(extracted)
+                break
+
+    return "\n".join(results) if results else ""
 
 
 async def _handle_memory_show(issue_key: str, repo_slug: str, bb: BitbucketClient, jira: JiraClient):
