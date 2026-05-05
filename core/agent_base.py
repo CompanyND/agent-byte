@@ -214,13 +214,28 @@ class AgentBase:
         CONTEXT_LIMIT = 150_000
         FILE_MAX_CHARS = 10_000
 
+        # 0. BYTE.md — projektová příručka, načítá se jako první
+        byte_md = ""
+        try:
+            byte_md_content = await bb.get_file(repo_slug, "BYTE.md")
+            if byte_md_content:
+                byte_md = byte_md_content
+                logger.info(f"[AgentBase] {repo_slug} — BYTE.md načten ({len(byte_md)} znaků)")
+            else:
+                logger.debug(f"[AgentBase] {repo_slug} — BYTE.md neexistuje, přeskakuji")
+        except Exception as e:
+            logger.debug(f"[AgentBase] {repo_slug} — BYTE.md: {e}")
+
         # 1. Strom repozitáře do hloubky 7
         try:
             tree = await bb.get_repo_tree(repo_slug, max_depth=7)
             tree_str = bb.format_tree(tree)
+            # Přidej BYTE.md na začátek tree_str pokud existuje
+            if byte_md:
+                tree_str = f"## BYTE.md — projektová příručka\n\n{byte_md}\n\n---\n\n{tree_str}"
         except Exception as e:
             logger.warning(f"[AgentBase] get_repo_tree selhal: {e}")
-            tree_str = ""
+            tree_str = f"## BYTE.md\n\n{byte_md}" if byte_md else ""
 
         # 2. Posledních 10 commitů
         try:

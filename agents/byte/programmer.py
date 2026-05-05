@@ -216,7 +216,20 @@ class ByteProgrammer:
             )
             return ProgrammingResult(False, message="Code generation skipped (insufficient info)")
 
-        # 7. Commitni soubory
+        # 7. Unit testy — pokud existuje testovací složka, vygeneruj testy
+        unit_test_file = await self._generate_unit_tests(
+            ticket_ctx=ticket_ctx,
+            stack=stack,
+            code_result=code_result,
+            repo_slug=repo_slug,
+            global_memory=global_mem,
+            project_memory=project_mem,
+        )
+        if unit_test_file:
+            code_result["files"].update(unit_test_file)
+            logger.info(f"[Programmer] {issue_key} — unit testy přidány: {list(unit_test_file.keys())}")
+
+        # 8. Commitni soubory
         commit_ok = await self._bb.commit_files(
             repo_slug=repo_slug,
             branch=branch_name,
@@ -312,6 +325,101 @@ class ByteProgrammer:
 
         logger.info(f"[Programmer] {issue_key} dokončeno — PR #{pr_id}: {pr_url}")
         return ProgrammingResult(True, branch=branch_name, pr_url=pr_url, pr_id=pr_id)
+
+    async def _generate_unit_tests(
+        self,
+        ticket_ctx: dict,
+        stack: dict,
+        code_result: dict,
+        repo_slug: str,
+        global_memory: str = "",
+        project_memory: str = "",
+    ) -> dict:
+        """Vygeneruje unit testy pokud existuje testovací složka v kořeni repo.
+
+        Hledá (v tomto pořadí): UnitTests/, Tests/, test/, spec/
+        Pokud žádná neexistuje → vrátí prázdný dict, nic se negeneruje.
+
+        Kdy generuje: nová business logika, oprava bugu, service vrstva.
+        Kdy negeneruje: čisté CRUD, presentační komponenty, generovaný kód.
+        """
+        model_cfg = cfg.agent("byte").model
+
+        # Najdi testovací složku — hledáme jen v kořeni repo
+        test_folder = None
+        for candidate in ["UnitTests", "Tests", "test", "spec"]:
+            try:
+                items = await self._bb.list_dir(repo_slug, candidate)
+                if items is not None:
+                    test_folder = candidate
+                    logger.info(f"[Programmer] Unit testy — složka nalezena: {test_folder}/")
+                    break
+            except Exception:
+                continue
+
+        if not test_folder:
+            logger.debug(f"[Programmer] Unit testy — žádná testovací složka v kořeni {repo_slug}, přeskakuji")
+            return {}
+
+        # Připrav kontext pro generování testů
+        issue_key = ticket_ctx.get("ticket_id", "")
+        changed_files = "\n".join(
+            f"### {path}\n```\n{content[:3000]}\n```"
+            for path, content in code_result.get("files", {}).items()
+        )
+
+        prompt = f"""Jsi {stack.get('angular') and 'Angular' or '.NET'} vývojář píšící unit testy.
+
+Ticket: {issue_key} — {ticket_ctx.get('ticket_summary', '')}
+Testovací složka: {test_folder}/
+Stack: {stack}
+Konvence pojmenování: {{TicketID}}_{{co_testuji}}_{{očekávaný_výsledek}}
+Příklad: {issue_key}_calculateRating_returnsNullForMissingData
+
+Změněné soubory:
+{changed_files[:6000]}
+
+Napiš unit testy POUZE pokud dávají smysl (nová business logika, oprava bugu, service vrstva).
+NEGENERUJ testy pro: čisté CRUD, presentační komponenty, generovaný kód.
+
+Pokud testy nemají smysl, vrať: {{"files": {{}}, "reason": "proč ne"}}
+
+Jinak vrať validní JSON:
+{{
+  "files": {{
+    "{test_folder}/{issue_key}_NazevTestu.cs": "celý obsah test souboru"
+  }}
+}}
+
+Pouze JSON, nic okolo."""
+
+        try:
+            response = self._client.messages.create(
+                model=model_cfg.model,
+                max_tokens=model_cfg.max_tokens,
+                messages=[{"role": "user", "content": prompt}],
+            )
+            raw = response.content[0].text.strip()
+
+            # Tolerantní parsing
+            import re as _re
+            match = _re.search(r'\{.*\}', raw, _re.DOTALL)
+            if not match:
+                return {}
+            data = __import__('json').loads(match.group())
+
+            files = data.get("files", {})
+            if not files:
+                reason = data.get("reason", "")
+                if reason:
+                    logger.info(f"[Programmer] Unit testy přeskočeny: {reason}")
+                return {}
+
+            return files
+
+        except Exception as e:
+            logger.warning(f"[Programmer] Unit testy selhaly (nekritické): {e}")
+            return {}
 
     async def _update_repo_memory(
         self,
