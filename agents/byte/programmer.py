@@ -129,13 +129,23 @@ class ByteProgrammer:
             return ProgrammingResult(False, message="Branch creation failed")
 
         # 6. Načti kompletní kontext repozitáře (strom 7 úrovní + soubory + commity)
-        tree_str, files_context, commits_str = await self._byte._get_repo_context(
-            repo_slug=repo_slug,
-            ticket_summary=ticket_ctx.get("summary", ""),
-            ticket_description=ticket_ctx.get("description", ""),
-            stack=stack,
-        )
-        logger.info(f"[Programmer] {issue_key} — kontext repozitáře načten")
+        try:
+            tree_str, files_context, commits_str = await asyncio.wait_for(
+                self._byte._get_repo_context(
+                    repo_slug=repo_slug,
+                    ticket_summary=ticket_ctx.get("summary", ""),
+                    ticket_description=ticket_ctx.get("description", ""),
+                    stack=stack,
+                ),
+                timeout=120,
+            )
+            logger.info(f"[Programmer] {issue_key} — kontext repozitáře načten")
+        except asyncio.TimeoutError:
+            logger.warning(f"[Programmer] {issue_key} — timeout kontextu (>120s), pokračuji bez něj")
+            tree_str, files_context, commits_str = "", "", ""
+        except Exception as e:
+            logger.warning(f"[Programmer] {issue_key} — chyba kontextu: {e}, pokračuji bez něj")
+            tree_str, files_context, commits_str = "", "", ""
 
         # 7. Vygeneruj kód
         code_result = await self._generate_code(
