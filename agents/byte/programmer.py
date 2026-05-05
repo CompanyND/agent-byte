@@ -949,6 +949,19 @@ class ByteProgrammer:
         )
 
         system_prompt = self._byte._build_system_prompt(task)
+        # Scope pravidla přidáme přímo do system promptu — mají vyšší prioritu
+        # než user message a Claude je nemůže při průzkumu ignorovat
+        system_prompt += """
+
+---
+## Absolutní pravidla scope — NELZE PORUŠIT
+
+1. **Programuj POUZE to, co ticket explicitně říká.** Žádné přidané opravy, žádná vylepšení okolního kódu.
+2. **Nedotýkej se souborů, které ticket nezmiňuje.** `boot.ts`, `app.module.ts`, `package.json` a podobné soubory jsou zakázané, pokud ticket přímo nepožaduje jejich změnu.
+3. **Nepřidávej závislosti** ani neměň verze závislostí — to není tvoje práce.
+4. **NIKDY nezakomentovávej starý kód** — buď ho oprav, nebo smaž.
+5. Pokud vidíš problém mimo scope ticketu, napiš ho do `skipped`. Neopravuj ho.
+"""
         user_message = self._byte._build_user_message(task)
 
         # Statický kontext (strom, commity, předem označené soubory)
@@ -996,13 +1009,20 @@ Máš k dispozici tyto nástroje:
 Pokud opravdu nemáš dost informací ani po průzkumu, vrať JSON s prázdným
 `files` a v `skipped` napiš konkrétně co chybí a kde jsi hledal.
 
-**Pravidla:**
+**Pravidla — scope:**
+- **Dělej POUZE to, co ticket explicitně říká.** Nic víc. Žádné "přidal jsem taky...", žádné "opravil jsem i...", žádné "bylo by dobré..."
+- **Neměň soubory, které nesouvisí s ticketem.** Pokud k fixu nepotřebuješ `boot.ts`, `app.module.ts`, `package.json` nebo jiné soubory — nedotýkej se jich.
+- **Nepřidávej závislosti** (`package.json`, `*.csproj`, `requirements.txt`) pokud je ticket explicitně nepožaduje.
+- **Neměň verze existujících závislostí** — ani nahoru, ani dolů. Verze jsou věc release managera, ne Byte.
+- **Žádné "vylepšení okolního kódu"** — i když vidíš problém jinde, vyřeš jen zadaný ticket. Na ostatní problémy udělej poznámku v `skipped`.
+
+**Pravidla — kvalita kódu:**
 - Piš kód odpovídající existující architektuře projektu (najdi si vzory)
 - Respektuj verzi stacku (Angular {stack.get('angular') or '?'}, .NET {stack.get('dotnet') or '?'})
 - Nevynechávej imports
 - Nepiš placeholdery jako "// TODO implement" — implementuj
 - V `files` posílej CELÝ obsah souboru (commit mechanismus potřebuje celý soubor) — ale měň jen minimum řádků nutných pro fix. Zbytek zkopíruj přesně jak je. Reviewer musí v PR diff na první pohled vidět co ses dotkl.
-- NIKDY nezakomentovávej starý kód (žádné `// old:`, `// bylo:`, `/* původní kód */` apod.) — buď ho oprav, nebo úplně smaž. Komentáře pro vysvětlení či pochopení kontextu jsou v pořádku, nenechávej ale mrtvý kód.
+- **NIKDY nezakomentovávej starý kód** (žádné `// old:`, `// bylo:`, `/* původní kód */` apod.) — buď ho oprav, nebo úplně smaž.
 """
 
         # Agentic loop
@@ -1143,12 +1163,14 @@ Pokud opravdu nemáš dost informací ani po průzkumu, vrať JSON s prázdným
                         f"— pošťuchuji k finální odpovědi"
                     )
 
-                # Sestav tool_result content (s případným nudge)
+                # Sestav tool_result content
+                # Nudge jde do tool_result (méně urgentní),
+                # FORCE jde jako samostatná user message (vyšší priorita)
                 tool_result_content = []
                 for i, (tu, result) in enumerate(zip(tool_uses, tool_results)):
-                    # Nudge přidáme k prvnímu tool_result aby ho Claude neprehlédl
                     result_text = result
-                    if nudge_msg and i == 0:
+                    # Nudge přidáme k prvnímu tool_result
+                    if nudge_msg and stagnation_score < self.STAGNATION_FORCE and i == 0:
                         result_text = result + f"\n\n{nudge_msg}"
                     tool_result_content.append({
                         "type": "tool_result",
@@ -1160,6 +1182,15 @@ Pokud opravdu nemáš dost informací ani po průzkumu, vrať JSON s prázdným
                     "role": "user",
                     "content": tool_result_content,
                 })
+
+                # FORCE — přidáme jako separátní user message po tool_results
+                # Claude to čte jako přímou instrukci, ne jako součást tool výsledku
+                if nudge_msg and stagnation_score >= self.STAGNATION_FORCE:
+                    messages.append({
+                        "role": "user",
+                        "content": nudge_msg,
+                    })
+
                 continue
 
             # end_turn / max_tokens / stop_sequence — máme finální odpověď
@@ -1218,6 +1249,19 @@ Pokud opravdu nemáš dost informací ani po průzkumu, vrať JSON s prázdným
         )
 
         system_prompt = self._byte._build_system_prompt(task)
+        # Scope pravidla přidáme přímo do system promptu — mají vyšší prioritu
+        # než user message a Claude je nemůže při průzkumu ignorovat
+        system_prompt += """
+
+---
+## Absolutní pravidla scope — NELZE PORUŠIT
+
+1. **Programuj POUZE to, co ticket explicitně říká.** Žádné přidané opravy, žádná vylepšení okolního kódu.
+2. **Nedotýkej se souborů, které ticket nezmiňuje.** `boot.ts`, `app.module.ts`, `package.json` a podobné soubory jsou zakázané, pokud ticket přímo nepožaduje jejich změnu.
+3. **Nepřidávej závislosti** ani neměň verze závislostí — to není tvoje práce.
+4. **NIKDY nezakomentovávej starý kód** — buď ho oprav, nebo smaž.
+5. Pokud vidíš problém mimo scope ticketu, napiš ho do `skipped`. Neopravuj ho.
+"""
         user_message = self._byte._build_user_message(task)
         user_message += """
 

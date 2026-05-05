@@ -26,22 +26,42 @@ BB_OAUTH = "https://bitbucket.org/site/oauth2/access_token"
 class BitbucketClient:
     """
     Bitbucket API klient pro Byte.
-    Jeden instance per agent — drží OAuth token cache.
+    Token cache a list_dir cache jsou class-level — přežívají mezi instancemi
+    (tj. mezi webhook requesty v rámci jednoho Railway procesu).
     """
+
+    # Class-level caches — sdílené napříč všemi instancemi v procesu
+    _class_token_cache: dict = {"token": None, "expires_at": 0.0}
+    _class_token_lock: Optional[asyncio.Lock] = None          # lazy init (event loop)
+    _class_listdir_cache: dict = {}   # {(repo_slug, path): (timestamp, values)}
+    _class_listdir_locks: dict = {}   # {(repo_slug, path): asyncio.Lock}
+    _class_listdir_ttl: float = 300.0  # 5 minut
 
     def __init__(self, agent_slug: str = "byte"):
         self._agent_cfg = cfg.agent(agent_slug).bitbucket
         self._workspace = self._agent_cfg.workspace
-        self._token_cache: dict = {"token": None, "expires_at": 0.0}
-        # Lock — zabraňuje paralelním refreshům tokenu (single-flight)
-        self._token_lock = asyncio.Lock()
-        # Cache pro list_dir výstupy: {(repo_slug, path): (timestamp, values)}
-        # Sdílená mezi detect_*, get_repo_tree atd.
-        self._listdir_cache: dict[tuple[str, str], tuple[float, list[dict]]] = {}
-        self._listdir_ttl = 300.0  # 5 minut — bezpečné pro typický webhook flow
-        # Per-(repo, path) lock — aby paralelní volání list_dir na stejnou cestu
-        # počkala místo aby každé střelilo vlastní HTTP request
-        self._listdir_locks: dict[tuple[str, str], asyncio.Lock] = {}
+
+    @property
+    def _token_cache(self) -> dict:
+        return BitbucketClient._class_token_cache
+
+    @property
+    def _token_lock(self) -> asyncio.Lock:
+        if BitbucketClient._class_token_lock is None:
+            BitbucketClient._class_token_lock = asyncio.Lock()
+        return BitbucketClient._class_token_lock
+
+    @property
+    def _listdir_cache(self) -> dict:
+        return BitbucketClient._class_listdir_cache
+
+    @property
+    def _listdir_locks(self) -> dict:
+        return BitbucketClient._class_listdir_locks
+
+    @property
+    def _listdir_ttl(self) -> float:
+        return BitbucketClient._class_listdir_ttl
 
     # -------------------------------------------------------------------------
     # OAuth2
