@@ -167,7 +167,7 @@ class ByteProgrammer:
         if not code_result:
             await self._jira.add_comment(
                 issue_key,
-                "❌ Generování kódu selhalo. Eskaluji na zadavatele."
+                "❌ Kód se mi nepodařilo vygenerovat.\n\nPravděpodobně nemám dost informací. Zkontroluj popis ticketu, přidej konkrétní detaily a přesuň zpět na **In development**."
             )
             return ProgrammingResult(False, message="Code generation failed")
 
@@ -587,7 +587,11 @@ class ByteProgrammer:
         # Přidáme instrukci pro strukturovaný výstup
         user_message += """
 
-Vygeneruj implementaci. Odpověz POUZE validním JSON v tomto formátu:
+Vygeneruj implementaci. Odpověz POUZE validním JSON — žádný jiný text před ani za JSON.
+NIKDY nepíšeš analýzu místo JSON.
+Pokud nemáš dost informací na implementaci, vrať:
+{"files": {}, "summary": "", "skipped": "Popis co přesně chybí a co potřebuješ doplnit"}
+
 {
   "files": {
     "cesta/k/souboru.ts": "obsah souboru",
