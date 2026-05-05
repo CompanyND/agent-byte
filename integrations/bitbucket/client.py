@@ -33,32 +33,55 @@ class BitbucketClient:
         self._agent_cfg = cfg.agent(agent_slug).bitbucket
         self._workspace = self._agent_cfg.workspace
         self._token_cache: dict = {"token": None, "expires_at": 0.0}
+        # Lock — zabraňuje paralelním refreshům tokenu (single-flight)
+        self._token_lock = asyncio.Lock()
+        # Cache pro list_dir výstupy: {(repo_slug, path): (timestamp, values)}
+        # Sdílená mezi detect_*, get_repo_tree atd.
+        self._listdir_cache: dict[tuple[str, str], tuple[float, list[dict]]] = {}
+        self._listdir_ttl = 300.0  # 5 minut — bezpečné pro typický webhook flow
+        # Per-(repo, path) lock — aby paralelní volání list_dir na stejnou cestu
+        # počkala místo aby každé střelilo vlastní HTTP request
+        self._listdir_locks: dict[tuple[str, str], asyncio.Lock] = {}
 
     # -------------------------------------------------------------------------
     # OAuth2
     # -------------------------------------------------------------------------
 
     async def _get_token(self) -> str:
-        """Vrátí platný OAuth2 access token, obnoví pokud expiruje."""
+        """Vrátí platný OAuth2 access token, obnoví pokud expiruje.
+
+        Single-flight přes asyncio.Lock — paralelní volání počkají na první
+        refresh místo aby každé udělalo vlastní POST /oauth2/access_token.
+        """
+        # Fast path bez locku — když je token platný, není důvod blokovat
         if self._token_cache["token"] and time.time() < self._token_cache["expires_at"] - 60:
             return self._token_cache["token"]
 
-        async with httpx.AsyncClient() as client:
-            resp = await client.post(
-                BB_OAUTH,
-                data={"grant_type": "client_credentials"},
-                auth=(
-                    self._agent_cfg.oauth_client_id,
-                    self._agent_cfg.oauth_client_secret,
-                ),
-                timeout=15,
-            )
-            resp.raise_for_status()
-            data = resp.json()
-            self._token_cache["token"] = data["access_token"]
-            self._token_cache["expires_at"] = time.time() + data.get("expires_in", 7200)
-            logger.info(f"[BB OAuth] Nový token získán, platný {data.get('expires_in', 7200)}s")
-            return self._token_cache["token"]
+        async with self._token_lock:
+            # Double-check uvnitř locku — mezitím mohl token získat někdo jiný
+            if self._token_cache["token"] and time.time() < self._token_cache["expires_at"] - 60:
+                return self._token_cache["token"]
+
+            async with httpx.AsyncClient() as client:
+                resp = await client.post(
+                    BB_OAUTH,
+                    data={"grant_type": "client_credentials"},
+                    auth=(
+                        self._agent_cfg.oauth_client_id,
+                        self._agent_cfg.oauth_client_secret,
+                    ),
+                    timeout=15,
+                )
+                resp.raise_for_status()
+                data = resp.json()
+                self._token_cache["token"] = data["access_token"]
+                self._token_cache["expires_at"] = time.time() + data.get("expires_in", 7200)
+                logger.info(f"[BB OAuth] Nový token získán, platný {data.get('expires_in', 7200)}s")
+                return self._token_cache["token"]
+
+    def invalidate_token(self) -> None:
+        """Zruší cachovaný token — užitečné při 401 z BB API."""
+        self._token_cache = {"token": None, "expires_at": 0.0}
 
     def _headers(self, token: str) -> dict:
         return {"Authorization": f"Bearer {token}"}
@@ -203,19 +226,55 @@ class BitbucketClient:
             return ""
 
     async def list_dir(self, repo_slug: str, path: str = "") -> list[dict]:
-        """Vrátí všechny soubory v dané cestě — se stránkováním."""
-        token = await self._get_token()
-        all_values = []
-        url = f"{BB_API}/repositories/{self._workspace}/{repo_slug}/src/HEAD/{path}?pagelen=100"
-        async with httpx.AsyncClient(follow_redirects=True) as client:
-            while url:
-                resp = await client.get(url, headers=self._headers(token), timeout=10)
-                if not resp.is_success:
-                    break
-                data = resp.json()
-                all_values.extend(data.get("values", []))
-                url = data.get("next")
-        return all_values
+        """Vrátí všechny soubory v dané cestě — se stránkováním a TTL cache.
+
+        Cache je per-(repo_slug, path) s TTL 5 minut. Paralelní volání
+        na stejnou cestu sdílí výsledek přes per-path lock — žádné duplicitní
+        API requesty během webhook flow.
+        """
+        cache_key = (repo_slug, path)
+        now = time.time()
+
+        # Fast path — čerstvý záznam v cache
+        cached = self._listdir_cache.get(cache_key)
+        if cached and (now - cached[0]) < self._listdir_ttl:
+            return cached[1]
+
+        # Per-path lock — když už někdo fetchuje stejnou cestu, počkáme
+        lock = self._listdir_locks.setdefault(cache_key, asyncio.Lock())
+        async with lock:
+            # Double-check — mezitím mohl naplnit cache
+            cached = self._listdir_cache.get(cache_key)
+            if cached and (time.time() - cached[0]) < self._listdir_ttl:
+                return cached[1]
+
+            token = await self._get_token()
+            all_values = []
+            url = f"{BB_API}/repositories/{self._workspace}/{repo_slug}/src/HEAD/{path}?pagelen=100"
+            async with httpx.AsyncClient(follow_redirects=True) as client:
+                while url:
+                    resp = await client.get(url, headers=self._headers(token), timeout=10)
+                    if not resp.is_success:
+                        break
+                    data = resp.json()
+                    all_values.extend(data.get("values", []))
+                    url = data.get("next")
+
+            self._listdir_cache[cache_key] = (time.time(), all_values)
+            return all_values
+
+    def invalidate_listdir_cache(self, repo_slug: Optional[str] = None) -> None:
+        """Zruší cache list_dir — buď celou nebo pro konkrétní repo.
+
+        Volat po commit_files / create_branch v daném repu, aby další čtení
+        nevracela starý strom.
+        """
+        if repo_slug is None:
+            self._listdir_cache.clear()
+            return
+        keys_to_drop = [k for k in self._listdir_cache if k[0] == repo_slug]
+        for k in keys_to_drop:
+            self._listdir_cache.pop(k, None)
 
     async def get_diff(self, diff_url: str) -> str:
         """Stáhne diff PR."""
@@ -418,6 +477,8 @@ class BitbucketClient:
             )
             if resp.is_success:
                 logger.info(f"[BB] Commit na {branch}: {message[:50]}")
+                # Strom se změnil — pročisti cache pro tento repo
+                self.invalidate_listdir_cache(repo_slug)
                 return True
             logger.error(f"[BB] Commit selhal: {resp.status_code} {resp.text[:200]}")
             return False
