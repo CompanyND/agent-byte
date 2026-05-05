@@ -165,11 +165,33 @@ class ByteProgrammer:
         )
 
         if not code_result:
+            logger.warning(
+                f"[Programmer] {issue_key} — code_result je None "
+                f"(JSON parse error nebo prázdná odpověď z Claude)"
+            )
             await self._jira.add_comment(
                 issue_key,
-                "❌ Kód se mi nepodařilo vygenerovat.\n\nPravděpodobně nemám dost informací. Zkontroluj popis ticketu, přidej konkrétní detaily a přesuň zpět na **In development**."
+                "❌ Kód se mi nepodařilo vygenerovat — odpověď z modelu nebyla "
+                "ve správném formátu (JSON parse error). Zkus to prosím znovu, "
+                "případně zkontroluj logy Byte agenta."
             )
-            return ProgrammingResult(False, message="Code generation failed")
+            return ProgrammingResult(False, message="Code generation failed (parse error)")
+
+        # Claude vrátil dict, ale prázdné files → poslal `skipped` s vysvětlením
+        if not code_result.get("files"):
+            skipped = code_result.get("skipped") or "Bez dalších detailů."
+            logger.warning(
+                f"[Programmer] {issue_key} — Claude vrátil prázdné files. "
+                f"Skipped: {skipped[:200]}"
+            )
+            await self._jira.add_comment(
+                issue_key,
+                f"❌ Nemám dost informací na implementaci.\n\n"
+                f"**Co mi chybí:**\n{skipped}\n\n"
+                f"Doplň prosím detaily do popisu ticketu a přesuň zpět na "
+                f"**In development**."
+            )
+            return ProgrammingResult(False, message="Code generation skipped (insufficient info)")
 
         # 7. Commitni soubory
         commit_ok = await self._bb.commit_files(
@@ -539,6 +561,268 @@ class ByteProgrammer:
             logger.warning(f"[Programmer] _fetch_relevant_files selhal: {e}")
             return {}
 
+    # -------------------------------------------------------------------------
+    # Tool definice pro Claude (search_code, get_file, list_dir)
+    # -------------------------------------------------------------------------
+
+    # Limit na celý loop — bezpečnostní strop. 15 turnů by mělo bohatě stačit
+    # i pro komplexní bugfix s několika hledáními a 2–3 načtenými soubory.
+    MAX_AGENT_TURNS = 15
+    # Limit na velikost obsahu jednoho souboru, který se vrací modelu
+    TOOL_FILE_MAX_CHARS = 8000
+
+    @staticmethod
+    def _agent_tools() -> list[dict]:
+        """Tool definice pro Claude tool use API."""
+        return [
+            {
+                "name": "search_code",
+                "description": (
+                    "Hledá v kódu repozitáře přes Bitbucket workspace search. "
+                    "Použij když potřebuješ najít, kde je definovaná určitá "
+                    "vlastnost, funkce, komponenta nebo kde se něco používá. "
+                    "Vrátí seznam souborů s úryvky kódu kolem shod. "
+                    "Hledání je code-aware — definice se řadí výš než použití. "
+                    "Tipy: pro frázi obal do uvozovek; používej konkrétní "
+                    "identifikátory (ne anglická slova jako 'error')."
+                ),
+                "input_schema": {
+                    "type": "object",
+                    "properties": {
+                        "query": {
+                            "type": "string",
+                            "description": (
+                                "Hledaný text. Příklady: 'Rating', "
+                                "'\"this.rating\"', 'getRatingValue'. "
+                                "Pro frázi víc slov použij \"\"."
+                            ),
+                        },
+                        "ext": {
+                            "type": "string",
+                            "description": (
+                                "Volitelná přípona souboru bez tečky "
+                                "(ts, cs, html, scss). Filtruje výsledky."
+                            ),
+                        },
+                        "path": {
+                            "type": "string",
+                            "description": (
+                                "Volitelný filtr cesty (např. "
+                                "'src/app/components')."
+                            ),
+                        },
+                    },
+                    "required": ["query"],
+                },
+            },
+            {
+                "name": "get_file",
+                "description": (
+                    "Načte celý obsah souboru z repozitáře (HEAD branche). "
+                    "Použij po search_code, když chceš vidět víc kontextu "
+                    "kolem nálezu — celý komponent, službu, model apod. "
+                    "Velké soubory budou zkrácené."
+                ),
+                "input_schema": {
+                    "type": "object",
+                    "properties": {
+                        "path": {
+                            "type": "string",
+                            "description": (
+                                "Cesta k souboru relativně k rootu repa. "
+                                "Příklad: 'src/app/components/rating/"
+                                "rating.component.ts'."
+                            ),
+                        },
+                    },
+                    "required": ["path"],
+                },
+            },
+            {
+                "name": "list_dir",
+                "description": (
+                    "Vypíše obsah adresáře v repozitáři. Použij když "
+                    "chceš prozkoumat strukturu konkrétní části projektu."
+                ),
+                "input_schema": {
+                    "type": "object",
+                    "properties": {
+                        "path": {
+                            "type": "string",
+                            "description": (
+                                "Cesta k adresáři relativně k rootu repa. "
+                                "Pro root nech prázdné."
+                            ),
+                        },
+                    },
+                },
+            },
+        ]
+
+    async def _execute_tool(self, name: str, tool_input: dict, repo_slug: str) -> str:
+        """Spustí jeden tool call a vrátí text result pro model."""
+        try:
+            if name == "search_code":
+                query = tool_input.get("query", "").strip()
+                if not query:
+                    return "Chyba: prázdný query."
+                results = await self._bb.search_code(
+                    query=query,
+                    repo_slug=repo_slug,
+                    ext=tool_input.get("ext"),
+                    path=tool_input.get("path"),
+                    max_results=15,
+                )
+                if not results:
+                    return f"Žádné výsledky pro '{query}'."
+                return self._bb.format_search_results(results)
+
+            if name == "get_file":
+                path = tool_input.get("path", "").strip()
+                if not path:
+                    return "Chyba: prázdná cesta."
+                content = await self._bb.get_file(repo_slug, path)
+                if content is None:
+                    return f"Soubor '{path}' neexistuje nebo není dostupný."
+                if len(content) > self.TOOL_FILE_MAX_CHARS:
+                    truncated = content[: self.TOOL_FILE_MAX_CHARS]
+                    return (
+                        f"=== {path} (zkráceno: {len(content)} znaků > "
+                        f"limit {self.TOOL_FILE_MAX_CHARS}) ===\n{truncated}\n"
+                        f"=== ... pokračování vynecháno ==="
+                    )
+                return f"=== {path} ===\n{content}"
+
+            if name == "list_dir":
+                path = tool_input.get("path", "") or ""
+                items = await self._bb.list_dir(repo_slug, path)
+                if not items:
+                    return f"Adresář '{path or '/'}' je prázdný nebo neexistuje."
+                lines = [f"Obsah {path or '/'}:"]
+                for item in items[:80]:
+                    item_path = item.get("path", "")
+                    name_only = item_path.split("/")[-1]
+                    kind = "📁" if item.get("type") == "commit_directory" else "📄"
+                    lines.append(f"  {kind} {name_only}")
+                if len(items) > 80:
+                    lines.append(f"  ... a dalších {len(items) - 80}")
+                return "\n".join(lines)
+
+            return f"Neznámý tool: {name}"
+        except Exception as e:
+            logger.warning(f"[Programmer] Tool '{name}' selhal: {e}")
+            return f"Chyba při volání toolu '{name}': {e}"
+
+    # -------------------------------------------------------------------------
+    # Pre-search heuristika
+    # -------------------------------------------------------------------------
+
+    @staticmethod
+    def _extract_search_candidates(text: str) -> list[str]:
+        """Vytáhne z textu identifikátory vhodné pro pre-search.
+
+        Hledá: CamelCase / camelCase identifikátory (3+ znaky), text
+        v uvozovkách/zpětných uvozovkách, konkrétní názvy souborů.
+        Filtruje běžná anglická slova a Jira/HTTP/AC keywords.
+        """
+        if not text:
+            return []
+
+        # Stopwords — buď příliš obecné, nebo specifické pro AC/Jira
+        STOPWORDS = {
+            "TypeError", "Error", "Exception", "Cannot", "Property", "True",
+            "False", "None", "Null", "Object", "Array", "String", "Number",
+            "Boolean", "Function", "Promise", "Observable", "Subject",
+            "Component", "Service", "Module", "Provider", "Injectable",
+            "Given", "When", "Then", "And", "Scenario", "Feature",
+            "Sentry", "Jira", "JIRA", "Bitbucket", "Angular", "React", "Vue",
+            "GIVEN", "WHEN", "THEN", "AND", "SCENARIO",
+            # České AC slova — typická v acceptance criteria
+            "Aplikace", "Uživatel", "Metoda", "Subscriber", "Hodnota",
+            "Objekt", "Vlastnost", "Stream", "Pipeline",
+        }
+
+        candidates: list[str] = []
+        seen: set[str] = set()
+
+        # 1. Text v uvozovkách (single, double, backticks) — typicky property names
+        for match in re.findall(r"['\"`]([A-Za-z_][A-Za-z0-9_]{1,30})['\"`]", text):
+            if match not in seen and match not in STOPWORDS and len(match) >= 3:
+                seen.add(match)
+                candidates.append(match)
+
+        # 2. CamelCase / PascalCase identifikátory (3+ znaků, max 30)
+        for match in re.findall(r"\b([A-Z][a-z]+(?:[A-Z][a-z]+){0,3}|[a-z]+(?:[A-Z][a-z]+){1,3})\b", text):
+            if (
+                match not in seen
+                and match not in STOPWORDS
+                and 3 <= len(match) <= 30
+            ):
+                seen.add(match)
+                candidates.append(match)
+
+        # 3. Názvy souborů — *.ts, *.cs, *.html, *.scss
+        for match in re.findall(r"\b([\w.-]+\.(?:ts|tsx|cs|html|scss|js|vue))\b", text):
+            if match not in seen:
+                seen.add(match)
+                candidates.append(match)
+
+        return candidates[:8]  # Max 8 kandidátů — zabraňuje rate limitu
+
+    async def _pre_search_context(
+        self, repo_slug: str, ticket_ctx: dict
+    ) -> str:
+        """Pre-search — z ticketu vytáhne kandidáty a paralelně prohledá repo.
+
+        Výstup je hotový string pro vložení do user message. Když nic nenajde,
+        vrátí prázdný řetězec.
+        """
+        # Kombinuj summary + description + AC; Sentry stack trace je v description
+        haystack = " ".join([
+            ticket_ctx.get("summary", "") or "",
+            ticket_ctx.get("description", "") or "",
+            ticket_ctx.get("acceptance_criteria", "") or "",
+        ])
+
+        candidates = self._extract_search_candidates(haystack)
+        if not candidates:
+            return ""
+
+        # Top 4 — víc nemá smysl, každý je 1 API call
+        top = candidates[:4]
+        logger.info(f"[Programmer] Pre-search kandidáti: {top}")
+
+        results = await asyncio.gather(
+            *[self._bb.search_code(q, repo_slug=repo_slug, max_results=10) for q in top],
+            return_exceptions=True,
+        )
+
+        sections = []
+        for q, r in zip(top, results):
+            if isinstance(r, Exception):
+                logger.warning(f"[Programmer] Pre-search '{q}' selhal: {r}")
+                continue
+            if not r:
+                continue
+            sections.append(
+                f"### Hledání '{q}' v {repo_slug}\n\n"
+                + self._bb.format_search_results(r[:5])
+            )
+
+        if not sections:
+            return ""
+
+        return (
+            "\n\n## Pre-search v repozitáři\n\n"
+            "Předem jsem prohledal repo na pravděpodobné identifikátory "
+            "z ticketu. Použij `search_code` pro další hledání.\n\n"
+            + "\n".join(sections)
+        )
+
+    # -------------------------------------------------------------------------
+    # Generování kódu — agentic loop s tool use
+    # -------------------------------------------------------------------------
+
     async def _generate_code(
         self,
         ticket_ctx: dict,
@@ -552,7 +836,9 @@ class ByteProgrammer:
         commits_str: str = "",
     ) -> Optional[dict]:
         """
-        Vygeneruje kód pro ticket.
+        Vygeneruje kód pro ticket pomocí agentic loop.
+        Claude má tooly search_code, get_file, list_dir a iterativně si
+        načítá kontext, dokud nemá dost informací pro implementaci.
         Vrátí {"files": {path: content}, "summary": str} nebo None.
         """
         model_cfg = cfg.agent("byte").model
@@ -576,7 +862,7 @@ class ByteProgrammer:
         system_prompt = self._byte._build_system_prompt(task)
         user_message = self._byte._build_user_message(task)
 
-        # Přidej kontext repozitáře do promptu
+        # Statický kontext (strom, commity, předem označené soubory)
         if tree_str:
             user_message += f"\n\n## Struktura repozitáře\n\n```\n{tree_str[:6000]}\n```"
         if commits_str:
@@ -584,47 +870,140 @@ class ByteProgrammer:
         if files_context:
             user_message += f"\n\n## Existující kód (relevantní soubory)\n\n{files_context}"
 
-        # Přidáme instrukci pro strukturovaný výstup
-        user_message += """
+        # Pre-search — vytáhne identifikátory a předhodí výsledky modelu
+        try:
+            pre_search = await self._pre_search_context(repo_slug, ticket_ctx)
+            if pre_search:
+                user_message += pre_search
+        except Exception as e:
+            logger.warning(f"[Programmer] Pre-search selhal (pokračuju bez něj): {e}")
 
-Vygeneruj implementaci. Odpověz POUZE validním JSON — žádný jiný text před ani za JSON.
-NIKDY nepíšeš analýzu místo JSON.
-Pokud nemáš dost informací na implementaci, vrať:
-{"files": {}, "summary": "", "skipped": "Popis co přesně chybí a co potřebuješ doplnit"}
+        # Instrukce pro tool use loop a finální JSON
+        user_message += f"""
 
-{
-  "files": {
-    "cesta/k/souboru.ts": "obsah souboru",
-    "cesta/k/souboru.spec.ts": "obsah testu"
-  },
-  "summary": "Co jsem udělal — 2-3 věty pro PR popis",
+## Postup
+
+Máš k dispozici tyto nástroje:
+- `search_code` — hledání v kódu repozitáře `{repo_slug}`
+- `get_file` — načtení celého obsahu souboru
+- `list_dir` — výpis adresáře
+
+**Pracuj iterativně:**
+1. Pokud nemáš dost kontextu, použij tooly pro průzkum kódu.
+2. Zaměř se na soubory, kterých se chyba týká — najdi je, načti, pochop.
+3. Když máš dost kontextu, vrať finální odpověď jako JSON (viz níže).
+
+**Finální odpověď** — POUZE validní JSON, nic okolo:
+
+{{
+  "files": {{
+    "cesta/k/souboru.ts": "celý nový obsah souboru",
+    "cesta/k/testu.spec.ts": "celý nový obsah testu"
+  }},
+  "summary": "Co jsem udělal — 2–3 věty pro PR popis",
   "skipped": "Co jsem záměrně vynechal a proč (nebo prázdný string)"
-}
+}}
 
-Pravidla:
-- Piš kód odpovídající existující architektuře projektu
-- Respektuj verzi stacku (Angular verzi, .NET verzi atd.)
+Pokud opravdu nemáš dost informací ani po průzkumu, vrať JSON s prázdným
+`files` a v `skipped` napiš konkrétně co chybí a kde jsi hledal.
+
+**Pravidla:**
+- Piš kód odpovídající existující architektuře projektu (najdi si vzory)
+- Respektuj verzi stacku (Angular {stack.get('angular') or '?'}, .NET {stack.get('dotnet') or '?'})
 - Nevynechávej imports
-- Nepiš placeholder komentáře jako "// TODO implement" — implementuj
-- Pokud něco opravdu nevíš, zahrň otázku do "skipped"
+- Nepiš placeholdery jako "// TODO implement" — implementuj
+- V `files` posílej CELÝ nový obsah souboru, ne jen diff
 """
 
-        response = self._client.messages.create(
-            model=model_cfg.model,
-            max_tokens=model_cfg.max_tokens,
-            system=system_prompt,
-            messages=[{"role": "user", "content": user_message}],
-        )
+        # Agentic loop
+        messages = [{"role": "user", "content": user_message}]
+        tools = self._agent_tools()
+        total_input_tokens = 0
+        total_output_tokens = 0
+        final_text: Optional[str] = None
 
-        raw = response.content[0].text
-        self._last_input_tokens = response.usage.input_tokens
-        self._last_output_tokens = response.usage.output_tokens
+        for turn in range(self.MAX_AGENT_TURNS):
+            response = self._client.messages.create(
+                model=model_cfg.model,
+                max_tokens=model_cfg.max_tokens,
+                system=system_prompt,
+                tools=tools,
+                messages=messages,
+            )
+
+            total_input_tokens += response.usage.input_tokens
+            total_output_tokens += response.usage.output_tokens
+
+            # Posbírej tool_use bloky a text bloky
+            tool_uses = [b for b in response.content if b.type == "tool_use"]
+            text_blocks = [b for b in response.content if b.type == "text"]
+
+            logger.info(
+                f"[Programmer] Turn {turn + 1}/{self.MAX_AGENT_TURNS} | "
+                f"stop: {response.stop_reason} | "
+                f"tools: {len(tool_uses)} | "
+                f"text: {sum(len(b.text) for b in text_blocks)} chars | "
+                f"tokeny: {response.usage.input_tokens}+"
+                f"{response.usage.output_tokens}"
+            )
+
+            if response.stop_reason == "tool_use" and tool_uses:
+                # Přidej assistant zprávu (celý content) a vykonej tooly paralelně
+                messages.append({"role": "assistant", "content": response.content})
+
+                tool_results = await asyncio.gather(*[
+                    self._execute_tool(tu.name, tu.input, repo_slug)
+                    for tu in tool_uses
+                ])
+
+                # Loguj pro přehled
+                for tu, result in zip(tool_uses, tool_results):
+                    preview = " ".join(str(tu.input).split())[:100]
+                    logger.info(
+                        f"[Programmer]   → {tu.name}({preview}) "
+                        f"→ {len(result)} chars"
+                    )
+
+                messages.append({
+                    "role": "user",
+                    "content": [
+                        {
+                            "type": "tool_result",
+                            "tool_use_id": tu.id,
+                            "content": result,
+                        }
+                        for tu, result in zip(tool_uses, tool_results)
+                    ],
+                })
+                continue
+
+            # end_turn / max_tokens / stop_sequence — máme finální odpověď
+            if text_blocks:
+                final_text = "\n".join(b.text for b in text_blocks)
+            break
+        else:
+            # Vyčerpali jsme turn limit — zkus vytáhnout poslední text
+            logger.warning(
+                f"[Programmer] Vyčerpán limit {self.MAX_AGENT_TURNS} turnů "
+                f"bez finální odpovědi"
+            )
+            text_blocks = [b for b in response.content if b.type == "text"]
+            if text_blocks:
+                final_text = "\n".join(b.text for b in text_blocks)
+
+        self._last_input_tokens = total_input_tokens
+        self._last_output_tokens = total_output_tokens
         logger.info(
-            f"[Programmer] Kód vygenerován | "
-            f"tokeny: {response.usage.input_tokens}+{response.usage.output_tokens}"
+            f"[Programmer] Loop hotov | "
+            f"celkem tokeny: {total_input_tokens}+{total_output_tokens}"
         )
 
-        return self._parse_code_response(raw)
+        if not final_text:
+            logger.error("[Programmer] Žádný finální text z modelu")
+            return None
+
+        return self._parse_code_response(final_text)
+
 
     async def _generate_fix(
         self,
@@ -677,17 +1056,49 @@ Zapracuj výše uvedené PR komentáře. Odpověz POUZE validním JSON:
         return self._parse_code_response(response.content[0].text)
 
     def _parse_code_response(self, raw: str) -> Optional[dict]:
-        """Parsuje JSON odpověď od Claudea."""
-        try:
-            clean = raw.strip()
-            # Odstraň markdown code bloky pokud jsou
-            clean = re.sub(r"^```json\s*", "", clean)
-            clean = re.sub(r"^```\s*", "", clean)
-            clean = re.sub(r"\s*```$", "", clean)
-            return json.loads(clean.strip())
-        except json.JSONDecodeError as e:
-            logger.error(f"[Programmer] JSON parse error: {e}\nRaw: {raw[:300]}")
+        """Parsuje JSON odpověď od Claudea.
+
+        Tolerantní vůči obalujícímu textu — Claude občas v agentic loopu
+        před nebo za JSON přidá komentář. Hledáme největší validní JSON
+        objekt obsahující "files".
+        """
+        if not raw:
             return None
+        clean = raw.strip()
+        # Odstraň markdown code bloky pokud jsou
+        clean = re.sub(r"^```(?:json)?\s*", "", clean)
+        clean = re.sub(r"\s*```$", "", clean)
+        clean = clean.strip()
+
+        # Fast path — celá zpráva je JSON
+        try:
+            return json.loads(clean)
+        except json.JSONDecodeError:
+            pass
+
+        # Fallback — najdi první { a poslední } a zkus dekódovat
+        start = clean.find("{")
+        end = clean.rfind("}")
+        if start != -1 and end > start:
+            candidate = clean[start : end + 1]
+            try:
+                return json.loads(candidate)
+            except json.JSONDecodeError as e:
+                head = raw[:500].replace("\n", " ")
+                tail = raw[-500:].replace("\n", " ") if len(raw) > 500 else ""
+                logger.error(
+                    f"[Programmer] JSON parse error: {e}\n"
+                    f"Raw length: {len(raw)} chars\n"
+                    f"Head: {head}\n"
+                    f"Tail: {tail}"
+                )
+                return None
+
+        logger.error(
+            f"[Programmer] V odpovědi nebyl nalezen JSON objekt. "
+            f"Raw length: {len(raw)} | Head: {raw[:300]}"
+        )
+        return None
 
     # -------------------------------------------------------------------------
     # Pomocné metody

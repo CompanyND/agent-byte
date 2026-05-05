@@ -276,6 +276,131 @@ class BitbucketClient:
         for k in keys_to_drop:
             self._listdir_cache.pop(k, None)
 
+    # -------------------------------------------------------------------------
+    # Code search — workspace-level grep
+    # -------------------------------------------------------------------------
+
+    async def search_code(
+        self,
+        query: str,
+        repo_slug: Optional[str] = None,
+        path: Optional[str] = None,
+        ext: Optional[str] = None,
+        lang: Optional[str] = None,
+        max_results: int = 20,
+    ) -> list[dict]:
+        """Hledá v kódu přes BB workspace search API.
+
+        Podporuje modifiery — viz https://support.atlassian.com/bitbucket-cloud/docs/search-in-bitbucket-cloud/
+
+        Args:
+            query: Hlavní hledaný text. Pro frázi obal do ""\\.
+            repo_slug: Omezit hledání jen na konkrétní repo.
+            path: Filtr cesty (např. "src/components").
+            ext: Přípona souboru bez tečky (např. "ts" nebo "cs").
+            lang: Jazyk (např. "typescript", "csharp", "javascript").
+            max_results: Limit výsledků (default 20, BB strop je 100/page).
+
+        Returns:
+            List dictů: [{"path": "...", "repo": "...", "matches": [{"line": int, "text": str}]}].
+            Prázdný list pokud nic nenašel nebo search není povolený.
+        """
+        # Sestav query s modifierama — BB má limit 9 expressions a 250 znaků
+        parts = [query]
+        if repo_slug:
+            parts.append(f'repo:{repo_slug}')
+        if path:
+            parts.append(f'path:{path}')
+        if ext:
+            parts.append(f'ext:{ext}')
+        if lang:
+            parts.append(f'lang:{lang}')
+        full_query = " ".join(parts)
+
+        if len(full_query) > 250:
+            logger.warning(
+                f"[BB Search] Query překračuje 250 znaků ({len(full_query)}), zkracuji"
+            )
+            full_query = full_query[:250]
+
+        token = await self._get_token()
+        url = f"{BB_API}/workspaces/{self._workspace}/search/code"
+        params = {
+            "search_query": full_query,
+            "pagelen": min(max_results, 100),
+            "fields": "+values.file.commit.repository.name",
+        }
+
+        try:
+            async with httpx.AsyncClient(follow_redirects=True) as client:
+                resp = await client.get(
+                    url, params=params, headers=self._headers(token), timeout=15
+                )
+                if resp.status_code == 400:
+                    body = resp.json() if resp.text else {}
+                    err_key = (body.get("data") or {}).get("key", "")
+                    if err_key == "SEARCH_NOT_ENABLED":
+                        logger.error(
+                            f"[BB Search] Search není povolený pro workspace "
+                            f"'{self._workspace}'. Zapni v "
+                            f"https://bitbucket.org/{self._workspace}/workspace/settings/search"
+                        )
+                        return []
+                    logger.warning(f"[BB Search] 400: {body}")
+                    return []
+                if not resp.is_success:
+                    logger.warning(f"[BB Search] {resp.status_code}: {resp.text[:200]}")
+                    return []
+                data = resp.json()
+        except Exception as e:
+            logger.warning(f"[BB Search] Selhalo: {e}")
+            return []
+
+        results = []
+        for v in data.get("values", [])[:max_results]:
+            file_info = v.get("file", {})
+            file_path = file_info.get("path", "")
+            commit = file_info.get("commit") or {}
+            repo_info = commit.get("repository") or {}
+            repo_name = repo_info.get("name", "")
+
+            # Sestav řádky — BB vrací "lines" se segments; my chceme jen text + číslo
+            matches = []
+            for cm in v.get("content_matches", []):
+                for line in cm.get("lines", []):
+                    line_num = line.get("line")
+                    text = "".join(seg.get("text", "") for seg in line.get("segments", []))
+                    if text.strip():
+                        matches.append({"line": line_num, "text": text.rstrip()})
+
+            results.append({
+                "path": file_path,
+                "repo": repo_name,
+                "matches": matches[:5],  # max 5 řádků na soubor — pro úsporu kontextu
+            })
+
+        logger.info(
+            f"[BB Search] '{full_query[:80]}' → {len(results)} výsledků"
+        )
+        return results
+
+    def format_search_results(self, results: list[dict]) -> str:
+        """Formátuje search výsledky pro vložení do promptu."""
+        if not results:
+            return "(žádné výsledky)"
+        lines = []
+        for r in results:
+            header = f"📄 {r['path']}"
+            if r.get("repo"):
+                header += f"  ({r['repo']})"
+            lines.append(header)
+            for m in r.get("matches", []):
+                ln = m.get("line", "?")
+                lines.append(f"   {ln}: {m['text'][:200]}")
+            lines.append("")
+        return "\n".join(lines)
+
+
     async def get_diff(self, diff_url: str) -> str:
         """Stáhne diff PR."""
         token = await self._get_token()
