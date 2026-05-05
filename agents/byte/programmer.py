@@ -58,8 +58,31 @@ class ByteProgrammer:
     async def run(self, issue_key: str) -> ProgrammingResult:
         """
         Kompletní programovací cyklus pro daný ticket.
-        Volá se když ticket přejde do In Progress s Bytem jako assignee.
+        Wrapper kolem _run_inner — garantuje, že se zaúčtují tokeny i při
+        neúspěchu nebo výjimce (tool calling loop může spotřebovat dost
+        tokenů i ve scénáři, kdy nedojdeme k commitu).
         """
+        # Reset counterů pro tento běh
+        self._last_input_tokens = 0
+        self._last_output_tokens = 0
+
+        try:
+            return await self._run_inner(issue_key)
+        finally:
+            # Vždy se pokus zaúčtovat — i při neúspěchu se tokeny spotřebovaly
+            if (
+                getattr(self, "_last_input_tokens", 0)
+                or getattr(self, "_last_output_tokens", 0)
+            ):
+                try:
+                    await self._update_ticket_cost(issue_key, None)
+                except Exception as e:
+                    logger.warning(
+                        f"[Programmer] {issue_key} — billing v finally selhal: {e}"
+                    )
+
+    async def _run_inner(self, issue_key: str) -> ProgrammingResult:
+        """Vlastní cyklus programátora — viz run()."""
         logger.info(f"[Programmer] Spouštím programovací cyklus pro {issue_key}")
 
         # 1. Načti kontext
@@ -285,8 +308,7 @@ class ByteProgrammer:
             log_lines.append(f"vynecháno: {code_skipped[:100]}")
         await self._bb.append_log(repo_slug, " | ".join(log_lines[:2]) + (f"\n  {log_lines[2]}" if len(log_lines) > 2 else ""))
 
-        # 12. Přičti cenu za tokeny do Jira customfield_10307
-        await self._update_ticket_cost(issue_key, code_result)
+        # Pozn.: účtování tokenů řeší finally v run() — garantované i při fail cestě.
 
         logger.info(f"[Programmer] {issue_key} dokončeno — PR #{pr_id}: {pr_url}")
         return ProgrammingResult(True, branch=branch_name, pr_url=pr_url, pr_id=pr_id)
@@ -1111,14 +1133,19 @@ Zapracuj výše uvedené PR komentáře. Odpověz POUZE validním JSON:
             cost_input = getattr(model_cfg, "cost_input_per_1m", 3.0)
             cost_output = getattr(model_cfg, "cost_output_per_1m", 15.0)
 
-            # Tokeny jsou v code_result metadata (pokud jsou)
-            # Fallback na 0 pokud nejsou k dispozici
+            # Tokeny se sčítají v _generate_code přes všechny turny tool loopu
             input_tokens = getattr(self, "_last_input_tokens", 0)
             output_tokens = getattr(self, "_last_output_tokens", 0)
 
-            if input_tokens or output_tokens:
-                cost = (input_tokens * cost_input + output_tokens * cost_output) / 1_000_000
-                await self._jira.update_cost(issue_key, cost)
+            if not (input_tokens or output_tokens):
+                return  # Nic se nespotřebovalo (např. fail před LLM voláním)
+
+            cost = (input_tokens * cost_input + output_tokens * cost_output) / 1_000_000
+            await self._jira.update_cost(issue_key, cost)
+            logger.info(
+                f"[Billing] {issue_key} | tokeny: {input_tokens}+{output_tokens} | "
+                f"cena: ${cost:.4f}"
+            )
         except Exception as e:
             logger.warning(f"[Programmer] Nepodařilo se aktualizovat cenu: {e}")
 
