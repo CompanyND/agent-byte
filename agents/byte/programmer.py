@@ -1001,7 +1001,8 @@ Pokud opravdu nemáš dost informací ani po průzkumu, vrať JSON s prázdným
 - Respektuj verzi stacku (Angular {stack.get('angular') or '?'}, .NET {stack.get('dotnet') or '?'})
 - Nevynechávej imports
 - Nepiš placeholdery jako "// TODO implement" — implementuj
-- V `files` posílej CELÝ nový obsah souboru, ne jen diff
+- V `files` posílej CELÝ obsah souboru (commit mechanismus potřebuje celý soubor) — ale měň jen minimum řádků nutných pro fix. Zbytek zkopíruj přesně jak je. Reviewer musí v PR diff na první pohled vidět co ses dotkl.
+- NIKDY nezakomentovávej starý kód (žádné `// old:`, `// bylo:`, `/* původní kód */` apod.) — buď ho oprav, nebo úplně smaž. Komentáře pro vysvětlení či pochopení kontextu jsou v pořádku, nenechávej ale mrtvý kód.
 """
 
         # Agentic loop
