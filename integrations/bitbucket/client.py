@@ -98,32 +98,59 @@ class BitbucketClient:
         Rekurzivně načte strukturu repozitáře do hloubky max_depth.
         Vrátí {path: [soubory]} pro každou složku.
 
-        ignore_dirs — složky které přeskočíme (bin, obj, node_modules atd.)
+        Chytré procházení — přeskakuje složky které neobsahují kód:
+        bin, obj, assets/fonts, backup, SQL, node_modules atd.
         """
         if ignore_dirs is None:
             ignore_dirs = {
-                "bin", "obj", ".git", "node_modules", ".vs", ".idea",
-                "packages", "wwwroot", "dist", "coverage", ".nyc_output",
-                "__pycache__", "migrations", "Migrations",
+                # Build výstupy
+                "bin", "obj", "dist", "build", "out", "output",
+                # VCS a IDE
+                ".git", ".vs", ".idea", ".vscode",
+                # Dependencies
+                "node_modules", "packages", "vendor",
+                # Statické soubory a media
+                "fonts", "img", "images", "icons", "svg", "video",
+                "wwwroot", "static", "public", "uploads",
+                # Skripty a styly (kompilované)
+                "script-src", "styles", "assets",
+                # Zálohy a pomocné složky
+                "backup", "dev", "temp", "tmp", "cache",
+                # DB scripty — nepotřebujeme číst SQL soubory
+                "SQL", "sql", "Playground", "migrations", "Migrations",
+                # Test coverage
+                "coverage", ".nyc_output",
+                # Python
+                "__pycache__",
+                # .NET nuget
+                ".nuget",
             }
 
         tree: dict[str, list] = {}
+        # Semaphore — max 15 souběžných API volání
+        semaphore = asyncio.Semaphore(15)
 
         async def _recurse(path: str, depth: int):
             if depth > max_depth:
                 return
-            try:
-                files = await self.list_dir(repo_slug, path)
-            except Exception:
-                return
+            async with semaphore:
+                try:
+                    files = await self.list_dir(repo_slug, path)
+                except Exception:
+                    return
 
             tree[path or "/"] = files
 
-            # Paralelně prozkoumej podsložky
+            # Paralelně prozkoumej podsložky — ale přeskakuj nepotřebné
             subdirs = [
                 f["path"] for f in files
                 if f.get("type") == "commit_directory"
                 and f["path"].split("/")[-1] not in ignore_dirs
+                # Přeskakuj zanořené assets/backup složky i pokud mají jiný název
+                and not any(
+                    skip in f["path"].lower()
+                    for skip in ("/backup/", "/assets/", "/script-src/", "/sql/", "/fonts/", "/img/")
+                )
             ]
 
             if subdirs:
