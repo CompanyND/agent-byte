@@ -582,7 +582,14 @@ async def handle_jira_event(request: Request):
                             result.append(c)
                             i += 1
                             if i < len(s):
-                                result.append(s[i])
+                                next_c = s[i]
+                                # Platné JSON escape sekvence
+                                if next_c in ('"', '\\', '/', 'b', 'f', 'n', 'r', 't', 'u'):
+                                    result.append(next_c)
+                                else:
+                                    # Neplatný escape — escapuj lomítko
+                                    result.append('\\')
+                                    result.append(next_c)
                         elif c == '"':
                             in_str = False
                             result.append(c)
