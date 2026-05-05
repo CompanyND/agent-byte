@@ -589,9 +589,12 @@ class ByteProgrammer:
 
     # Limit na celý loop — bezpečnostní strop. 15 turnů by mělo bohatě stačit
     # i pro komplexní bugfix s několika hledáními a 2–3 načtenými soubory.
-    MAX_AGENT_TURNS = 15
+    MAX_AGENT_TURNS = 10
     # Limit na velikost obsahu jednoho souboru, který se vrací modelu
     TOOL_FILE_MAX_CHARS = 8000
+    # Stagnation score thresholdy
+    STAGNATION_NUDGE = 4    # jemné pošťouchnutí
+    STAGNATION_FORCE = 6    # tvrdý požadavek na JSON
 
     @staticmethod
     def _agent_tools() -> list[dict]:
@@ -681,8 +684,14 @@ class ByteProgrammer:
             },
         ]
 
-    async def _execute_tool(self, name: str, tool_input: dict, repo_slug: str) -> str:
-        """Spustí jeden tool call a vrátí text result pro model."""
+    async def _execute_tool(self, name: str, tool_input: dict, repo_slug: str) -> tuple[str, str]:
+        """Spustí jeden tool call a vrátí (text result, fingerprint).
+
+        Fingerprint slouží pro detekci zacyklení — je to deterministický
+        string reprezentující obsah výsledku (setříděné cesty souborů nebo
+        cesta k souboru). Pokud se fingerprint opakuje, Claude nic nového
+        nezjistil.
+        """
         try:
             if name == "search_code":
                 query = tool_input.get("query", "").strip()
@@ -696,8 +705,9 @@ class ByteProgrammer:
                     max_results=15,
                 )
                 if not results:
-                    return f"Žádné výsledky pro '{query}'."
-                return self._bb.format_search_results(results)
+                    return f"Žádné výsledky pro '{query}'.", f"empty:{query}"
+                fp = "|".join(sorted(r["path"] for r in results))
+                return self._bb.format_search_results(results), f"search:{fp}"
 
             if name == "get_file":
                 path = tool_input.get("path", "").strip()
@@ -705,21 +715,22 @@ class ByteProgrammer:
                     return "Chyba: prázdná cesta."
                 content = await self._bb.get_file(repo_slug, path)
                 if content is None:
-                    return f"Soubor '{path}' neexistuje nebo není dostupný."
+                    return f"Soubor '{path}' neexistuje nebo není dostupný.", f"missing:{path}"
                 if len(content) > self.TOOL_FILE_MAX_CHARS:
                     truncated = content[: self.TOOL_FILE_MAX_CHARS]
-                    return (
+                    text = (
                         f"=== {path} (zkráceno: {len(content)} znaků > "
                         f"limit {self.TOOL_FILE_MAX_CHARS}) ===\n{truncated}\n"
                         f"=== ... pokračování vynecháno ==="
                     )
-                return f"=== {path} ===\n{content}"
+                    return text, f"file:{path}"
+                return f"=== {path} ===\n{content}", f"file:{path}"
 
             if name == "list_dir":
                 path = tool_input.get("path", "") or ""
                 items = await self._bb.list_dir(repo_slug, path)
                 if not items:
-                    return f"Adresář '{path or '/'}' je prázdný nebo neexistuje."
+                    return f"Adresář '{path or '/'}' je prázdný nebo neexistuje.", f"empty_dir:{path}"
                 lines = [f"Obsah {path or '/'}:"]
                 for item in items[:80]:
                     item_path = item.get("path", "")
@@ -728,12 +739,12 @@ class ByteProgrammer:
                     lines.append(f"  {kind} {name_only}")
                 if len(items) > 80:
                     lines.append(f"  ... a dalších {len(items) - 80}")
-                return "\n".join(lines)
+                return "\n".join(lines), f"dir:{path}"
 
-            return f"Neznámý tool: {name}"
+            return f"Neznámý tool: {name}", f"unknown:{name}"
         except Exception as e:
             logger.warning(f"[Programmer] Tool '{name}' selhal: {e}")
-            return f"Chyba při volání toolu '{name}': {e}"
+            return f"Chyba při volání toolu '{name}': {e}", f"error:{name}"
 
     # -------------------------------------------------------------------------
     # Pre-search heuristika
@@ -762,7 +773,13 @@ class ByteProgrammer:
             # České AC slova — typická v acceptance criteria
             "Aplikace", "Uživatel", "Metoda", "Subscriber", "Hodnota",
             "Objekt", "Vlastnost", "Stream", "Pipeline",
+            # Sentry/Jira obecná slova
+            "Issue", "Ticket", "Bug", "Task", "Story", "Sprint",
         }
+
+        # Regex pro minified JS bundle chunky (hash 8+ hex znaků)
+        # Příklady: 23.7b287c150bbf691de56c.js, main.eff166e8985ffabbc879.js
+        _MINIFIED_RE = re.compile(r"[a-f0-9]{8,}")
 
         candidates: list[str] = []
         seen: set[str] = set()
@@ -783,13 +800,63 @@ class ByteProgrammer:
                 seen.add(match)
                 candidates.append(match)
 
-        # 3. Názvy souborů — *.ts, *.cs, *.html, *.scss
+        # 3. Názvy souborů — *.ts, *.cs, *.html, *.scss (ne minified bundle chunky)
         for match in re.findall(r"\b([\w.-]+\.(?:ts|tsx|cs|html|scss|js|vue))\b", text):
-            if match not in seen:
+            if match not in seen and not _MINIFIED_RE.search(match):
                 seen.add(match)
                 candidates.append(match)
 
         return candidates[:8]  # Max 8 kandidátů — zabraňuje rate limitu
+
+    @staticmethod
+    def _tokenize_query(query: str) -> frozenset[str]:
+        """Rozdělí search query na tokeny pro porovnání podobnosti.
+
+        Odstraní BB search modifiery (repo:, ext:, path:, lang:),
+        uvozovky a rozdělí na slova >=3 znaky.
+        """
+        # Odstraň BB modifiery
+        q = re.sub(r"\b(?:repo|ext|path|lang):\S+", "", query)
+        # Odstraň uvozovky a speciální znaky
+        q = re.sub(r"[\x27\"` ()\[\]{}]", " ", q)
+        return frozenset(w.lower() for w in q.split() if len(w) >= 3)
+
+    def _compute_stagnation_score(
+        self,
+        turn_fps: list[str],
+        seen_fps: set[str],
+        unique_paths: set[str],
+        prev_unique_count: int,
+        turn_queries: list[str],
+        recent_queries: list[frozenset[str]],
+    ) -> int:
+        """Spočítá stagnation score pro aktuální turn (0–3).
+
+        +1  Všechny fingerprinty turnu jsou už viděné (duplicitní výsledky)
+        +1  Počet unikátních cest se od minulého turnu nezvýšil (žádné nové info)
+        +1  Alespoň jeden search query sdílí token s některým z posledních 2 turnů
+        """
+        score = 0
+
+        # Signál 1: duplicitní fingerprinty
+        if turn_fps and all(fp in seen_fps for fp in turn_fps):
+            score += 1
+
+        # Signál 2: žádné nové soubory
+        if len(unique_paths) == prev_unique_count and unique_paths:
+            score += 1
+
+        # Signál 3: query variuje stejné téma
+        if turn_queries and recent_queries:
+            current_tokens = frozenset().union(*[
+                self._tokenize_query(q) for q in turn_queries
+            ])
+            for prev_tokens in recent_queries[-2:]:
+                if len(current_tokens & prev_tokens) >= 1:
+                    score += 1
+                    break
+
+        return score
 
     async def _pre_search_context(
         self, repo_slug: str, ticket_ctx: dict
@@ -944,6 +1011,12 @@ Pokud opravdu nemáš dost informací ani po průzkumu, vrať JSON s prázdným
         total_output_tokens = 0
         final_text: Optional[str] = None
 
+        # Stagnation tracking
+        seen_fps: set[str] = set()          # viděné fingerprinty
+        unique_paths: set[str] = set()      # unikátní cesty souborů celkem
+        recent_query_tokens: list[frozenset[str]] = []  # tokenizované queries posledních turnů
+        stagnation_score = 0                # kumulativní score
+
         for turn in range(self.MAX_AGENT_TURNS):
             response = self._client.messages.create(
                 model=model_cfg.model,
@@ -964,6 +1037,7 @@ Pokud opravdu nemáš dost informací ani po průzkumu, vrať JSON s prázdným
                 f"[Programmer] Turn {turn + 1}/{self.MAX_AGENT_TURNS} | "
                 f"stop: {response.stop_reason} | "
                 f"tools: {len(tool_uses)} | "
+                f"stagnation: {stagnation_score} | "
                 f"text: {sum(len(b.text) for b in text_blocks)} chars | "
                 f"tokeny: {response.usage.input_tokens}+"
                 f"{response.usage.output_tokens}"
@@ -973,10 +1047,14 @@ Pokud opravdu nemáš dost informací ani po průzkumu, vrať JSON s prázdným
                 # Přidej assistant zprávu (celý content) a vykonej tooly paralelně
                 messages.append({"role": "assistant", "content": response.content})
 
-                tool_results = await asyncio.gather(*[
+                raw_results = await asyncio.gather(*[
                     self._execute_tool(tu.name, tu.input, repo_slug)
                     for tu in tool_uses
                 ])
+
+                # Rozbal (text, fingerprint) tuples
+                tool_results = [r[0] for r in raw_results]
+                turn_fps = [r[1] for r in raw_results]
 
                 # Loguj pro přehled
                 for tu, result in zip(tool_uses, tool_results):
@@ -986,16 +1064,100 @@ Pokud opravdu nemáš dost informací ani po průzkumu, vrať JSON s prázdným
                         f"→ {len(result)} chars"
                     )
 
+                # --- Stagnation score ---
+                prev_unique_count = len(unique_paths)
+
+                # Extrahuj cesty ze search výsledků a get_file volání
+                turn_queries: list[str] = []
+                for tu in tool_uses:
+                    if tu.name == "search_code":
+                        q = tu.input.get("query", "")
+                        if q:
+                            turn_queries.append(q)
+                    elif tu.name == "get_file":
+                        p = tu.input.get("path", "")
+                        if p:
+                            unique_paths.add(p)
+
+                # Extrahuj cesty z fingerprints search výsledků
+                for fp in turn_fps:
+                    if fp.startswith("search:"):
+                        for p in fp[7:].split("|"):
+                            if p:
+                                unique_paths.add(p)
+
+                turn_score = self._compute_stagnation_score(
+                    turn_fps=turn_fps,
+                    seen_fps=seen_fps,
+                    unique_paths=unique_paths,
+                    prev_unique_count=prev_unique_count,
+                    turn_queries=turn_queries,
+                    recent_queries=recent_query_tokens,
+                )
+
+                # Pokud přibyly nové cesty, resetuj score — Claude postupuje vpřed
+                if len(unique_paths) > prev_unique_count:
+                    stagnation_score = 0
+                else:
+                    stagnation_score += turn_score
+
+                # Aktualizuj tracking
+                seen_fps.update(turn_fps)
+                if turn_queries:
+                    recent_query_tokens.append(frozenset().union(*[
+                        self._tokenize_query(q) for q in turn_queries
+                    ]))
+                    recent_query_tokens = recent_query_tokens[-3:]  # max 3
+
+                logger.debug(
+                    f"[Programmer]   Stagnation turn_score={turn_score} "
+                    f"cumulative={stagnation_score} "
+                    f"unique_paths={len(unique_paths)}"
+                )
+
+                # Nudge / force na základě kumulativního score
+                nudge_msg: Optional[str] = None
+                if stagnation_score >= self.STAGNATION_FORCE:
+                    nudge_msg = (
+                        "[STOP HLEDÁNÍ — POSLEDNÍ VAROVÁNÍ] "
+                        "Opakuješ stejné dotazy a nenacházíš nic nového. "
+                        "Máš dost kontextu. NYNÍ musíš vrátit finální JSON "
+                        "s {\"files\": ..., \"summary\": ..., \"skipped\": ...}. "
+                        "Žádný další tool_use. Pouze JSON."
+                    )
+                    logger.warning(
+                        f"[Programmer] Stagnation FORCE (score={stagnation_score}) "
+                        f"— posílám tvrdé upozornění"
+                    )
+                elif stagnation_score >= self.STAGNATION_NUDGE:
+                    nudge_msg = (
+                        "[Pozn. pro Byte] Opakuješ výsledky, které už znáš. "
+                        "Vyčerpal jsi dostupný kontext z tohoto repozitáře. "
+                        "Pokud máš dost informací → vrať finální JSON. "
+                        "Pokud ne → zkus zcela odlišný typ dotazu nebo vrať "
+                        "JSON s prázdným files a v skipped napiš co ti chybí."
+                    )
+                    logger.info(
+                        f"[Programmer] Stagnation NUDGE (score={stagnation_score}) "
+                        f"— pošťuchuji k finální odpovědi"
+                    )
+
+                # Sestav tool_result content (s případným nudge)
+                tool_result_content = []
+                for i, (tu, result) in enumerate(zip(tool_uses, tool_results)):
+                    # Nudge přidáme k prvnímu tool_result aby ho Claude neprehlédl
+                    result_text = result
+                    if nudge_msg and i == 0:
+                        result_text = result + f"\n\n{nudge_msg}"
+                    tool_result_content.append({
+                        "type": "tool_result",
+                        "tool_use_id": tu.id,
+                        "content": result_text,
+                    })
+
                 messages.append({
                     "role": "user",
-                    "content": [
-                        {
-                            "type": "tool_result",
-                            "tool_use_id": tu.id,
-                            "content": result,
-                        }
-                        for tu, result in zip(tool_uses, tool_results)
-                    ],
+                    "content": tool_result_content,
                 })
                 continue
 
@@ -1007,7 +1169,7 @@ Pokud opravdu nemáš dost informací ani po průzkumu, vrať JSON s prázdným
             # Vyčerpali jsme turn limit — zkus vytáhnout poslední text
             logger.warning(
                 f"[Programmer] Vyčerpán limit {self.MAX_AGENT_TURNS} turnů "
-                f"bez finální odpovědi"
+                f"bez finální odpovědi (stagnation_score={stagnation_score})"
             )
             text_blocks = [b for b in response.content if b.type == "text"]
             if text_blocks:
